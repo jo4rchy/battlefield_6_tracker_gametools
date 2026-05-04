@@ -1,6 +1,6 @@
 # BF6 Tracker — self-hosted TRN-shaped API backed by Gametools
 
-**Version: 0.0.4.4**
+**Version: 0.0.4.6**
 
 A small FastAPI service that:
 
