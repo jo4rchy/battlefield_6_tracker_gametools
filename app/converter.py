@@ -593,7 +593,6 @@ def _level_segments(stats: Dict[str, Any]) -> List[Dict[str, Any]]:
         })
     return segs
 
-
 def _weapon_stats_block(it: Dict[str, Any]) -> Dict[str, Any]:
     kills = _i(it.get("kills"))
     time_eq = _i(it.get("timeEquipped"))
