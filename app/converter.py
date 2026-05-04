@@ -410,7 +410,21 @@ def _overview_segment(stats: Dict[str, Any], profile: Optional[Dict[str, Any]]) 
 # ------------------------------------------------------------------
 
 def _fmt_img(item: Dict[str, Any]) -> str:
-    return item.get("image") or item.get("altImage") or ""
+    img = item.get("image") or item.get("altImage")
+    if img:
+        return img
+    
+    item_id = str(item.get("id", "")).strip().lower()
+    name = str(item.get("name", "")).strip()
+    class_name = str(item.get("className", "")).strip()
+    map_name = str(item.get("mapName", "")).strip()
+    
+    if item_id == "lvllvlmpsubsurface" or map_name == "Hagental Base":
+        return "https://image.battlefield.su/bf6/maps/hagental_base.jpg"
+    if item_id == "kit_kit_engineer" or class_name == "Engineer" or name == "Engineer":
+        return "https://image.battlefield.su/bf6/classes/white/Engineer.svg"
+    
+    return ""
 
 
 def _gamemode_stats_block(it: Dict[str, Any]) -> Dict[str, Any]:

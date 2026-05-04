@@ -281,7 +281,24 @@ def _item_name(it: Dict[str, Any], name_fields: List[str]) -> str:
     return str(it.get("id", ""))
 
 def _item_image(it: Dict[str, Any]) -> str:
-    return (it.get("image") or it.get("altImage") or "") if isinstance(it, dict) else ""
+    if not isinstance(it, dict):
+        return ""
+    
+    img = it.get("image") or it.get("altImage")
+    if img:
+        return img
+    
+    item_id = str(it.get("id", "")).strip().lower()
+    name = str(it.get("name", "")).strip()
+    class_name = str(it.get("className", "")).strip()
+    map_name = str(it.get("mapName", "")).strip()
+    
+    if item_id == "lvllvlmpsubsurface" or map_name == "Hagental Base":
+        return "https://image.battlefield.su/bf6/maps/hagental_base.jpg"
+    if item_id == "kit_kit_engineer" or class_name == "Engineer" or name == "Engineer":
+        return "https://image.battlefield.su/bf6/classes/white/Engineer.svg"
+    
+    return ""
 
 
 # ---- overview delta ----
