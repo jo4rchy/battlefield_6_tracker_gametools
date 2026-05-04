@@ -143,11 +143,11 @@ curl "http://localhost:8000/profile?identifier=1009230165587&platform=pc"
 
 3. The API is now on `http://<nas-ip>:8000`. The SQLite DB lives on the host at `./data/bf6_stats.db`, so it survives container restarts, image rebuilds, and NAS reboots. The background poller starts automatically and refreshes every tracked profile every 5 minutes.
 
-4. (Optional) Put a reverse proxy in front of it — e.g. Nginx Proxy Manager — and bind it to `battlefieldtracker.joarchy.com`. Then in `docker-compose.yml`:
+4. (Optional) Put a reverse proxy in front of it — e.g. Nginx Proxy Manager — and bind it to `example.domain`. Then in `docker-compose.yml`:
 
    ```yaml
    environment:
-     BF6_CORS_ORIGINS: "https://battlefieldtracker.joarchy.com,http://localhost:5173"
+     BF6_CORS_ORIGINS: "https://example.domain,http://localhost:5173"
    ```
 
 ### Pre-built image → NAS workflow
