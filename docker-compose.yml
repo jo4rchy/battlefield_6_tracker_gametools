@@ -1,0 +1,22 @@
+services:
+  bf6-tracker:
+    build: .
+    image: bf6-tracker:latest
+    container_name: bf6-tracker
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      # SQLite file inside the container; the volume below persists it on the NAS
+      BF6_DB_PATH: /app/data/bf6_stats.db
+      # lock this down to your frontend origin(s) once it's deployed, e.g.:
+      #   BF6_CORS_ORIGINS: "https://battlefieldtracker.joarchy.com,http://localhost:5173"
+      BF6_CORS_ORIGINS: "*"
+      TZ: Asia/Hong_Kong
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
