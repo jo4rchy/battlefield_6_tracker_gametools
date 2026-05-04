@@ -588,7 +588,7 @@ def _level_segments(stats: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "matchesPlayed": _stat("Matches Played", "Game", "game", matches),
                 "matchesWon":    _stat("Wins",           "Game", "game", wins),
                 "matchesLost":   _stat("Losses",         "Game", "game", losses),
-                "wlPercentage":  _stat("W/L %",          "Game", "game", _f(m.get("winPercent")), display_type="Percentage"),
+                "wlPercentage":  _stat("W/L %",          "Game", "game", _pct(m.get("winPercent")), display_type="Percentage"),
             },
         })
     return segs
