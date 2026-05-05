@@ -1,6 +1,9 @@
 # BF6 Tracker — self-hosted TRN-shaped API backed by Gametools
 
-**Version: 0.0.4.6**
+> Current version is sourced from `app/__init__.py` (`__version__`). Bump that
+> one line to cut a release — every other reference (FastAPI metadata, `/ping`
+> + `/status` JSON, Docker `LABEL`, `build.sh` image tag and tarball name)
+> reads from it automatically.
 
 A small FastAPI service that:
 
@@ -143,26 +146,32 @@ curl "http://localhost:8000/profile?identifier=1009230165587&platform=pc"
 
 3. The API is now on `http://<nas-ip>:8000`. The SQLite DB lives on the host at `./data/bf6_stats.db`, so it survives container restarts, image rebuilds, and NAS reboots. The background poller starts automatically and refreshes every tracked profile every 5 minutes.
 
-4. (Optional) Put a reverse proxy in front of it — e.g. Nginx Proxy Manager — and bind it to `example.domain`. Then in `docker-compose.yml`:
+4. (Optional) Put a reverse proxy in front of it — e.g. Nginx Proxy Manager — and bind it to `battlefieldtracker.joarchy.com`. Then in `docker-compose.yml`:
 
    ```yaml
    environment:
-     BF6_CORS_ORIGINS: "https://example.domain,http://localhost:5173"
+     BF6_CORS_ORIGINS: "https://battlefieldtracker.joarchy.com,http://localhost:5173"
    ```
 
 ### Pre-built image → NAS workflow
 
-If you build the image on your dev box instead of on the NAS, export it and load it over SSH — see the comment block at the end of `app/api.py` for the exact commands. Short version:
+The `build.sh` script at the repo root reads `__version__` from `app/__init__.py` and produces a correctly-tagged image plus a `bf6-tracker-amd64-v<version>.tar` tarball. Copy the tarball to the NAS and load it.
 
 ```bash
 # on dev box (linux/amd64 for Synology / x86 NAS)
-docker buildx build --no-cache --platform linux/amd64 -t bf6-tracker:latest --load .
-docker save bf6-tracker:latest -o bf6-tracker-amd64.tar
+./build.sh                                # build + tag + save tarball
 
-# on NAS
-docker load -i bf6-tracker-amd64.tar
-docker compose up -d
+# copy + load on NAS
+scp bf6-tracker-amd64-v*.tar user@nas:/volume1/docker/bf6-tracker/
+ssh user@nas "cd /volume1/docker/bf6-tracker \
+  && docker load -i bf6-tracker-amd64-v*.tar \
+  && docker compose up -d"
+
+# verify which version the NAS is now running
+curl -s http://<nas>:8000/ping | jq .version
 ```
+
+`build.sh` also accepts `--no-tar` (build the image only) and `--push <repo>` (build + push to a registry instead of saving a tarball).
 
 ### Logs, restart, update
 
@@ -207,6 +216,62 @@ The storage is already compatible with a streaming widget:
 - `POST /refresh?identifier=<id>` can still be hit from OBS-startup so the widget always begins with a fresh baseline.
 
 ## Changelog
+
+### v0.0.6 — image-URL override dictionary
+
+Gametools' CDN occasionally returns blank `image` / `altImage` fields, leaving the frontend with broken tiles. v0.0.6 adds a local override dictionary so operators can fill in missing assets without rebuilding the image.
+
+**Two env vars** control behaviour, both optional:
+
+| var | default | meaning |
+|---|---|---|
+| `BF6_IMAGE_DICT_PATH` | `data/image_dict.json` | path to the overrides JSON. Lives in the same `data/` volume as the SQLite DB so you can edit on the host without rebuilding. |
+| `BF6_IMAGE_DICT_MODE` | `fallback` | `fallback` (gametools first, dict only when blank), `override` (dict first, gametools as backup), or `off` (ignore dict entirely). |
+
+**File format** — flat JSON keyed by gametools `id`. Keys starting with `_comment_` are silently dropped at load, so you can use them as headings in the file without breaking lookups:
+
+```json
+{
+  "_comment_levels": "level images",
+  "lvlmpaftermath": "https://your-cdn/levels/aftermath.jpg",
+  "_comment_weapons": "weapons",
+  "wp_mg_l110":      "https://your-cdn/weapons/l110.png"
+}
+```
+
+A missing or empty file is silently treated as `{}`, so the feature is dormant until you create one. Loaded once at module import — `docker compose restart bf6-tracker` to pick up edits.
+
+**Coverage**: every TRN segment whose `imageUrl` flows through `converter._fmt_img` or `main._item_image` — weapons, vehicles, gadgets, kits, levels, gamemodes, and the corresponding `*-category` segments. The player rank icon (`rankImage.large/small` shape) is out of scope; if you want rank icon overrides, ask.
+
+**Starter template generator** — `scripts/gen_image_dict_template.py` walks your SQLite DB and emits a JSON template containing only the ids whose imageUrl is currently blank, grouped by entity type:
+
+```bash
+python3 scripts/gen_image_dict_template.py
+# scanned 200 profile(s) + N match(es); wrote 34 id(s) to data/image_dict.json.template
+```
+
+Inspect the template, fill in URLs for the assets you care about, save as `data/image_dict.json`, restart. `--include-known` produces a full reference catalog with current gametools URLs prefilled if you'd rather edit a complete view.
+
+### v0.0.5 — storage compression + single-source version
+
+The `matches.match_json` and `profiles.trn_profile_json` columns were ballooning the SQLite file: at 200 tracked players the prod DB had reached ~250MB, projected to fill a 30GB VPS disk in roughly two months. v0.0.5 transparently gzip-compresses both columns at write time and decompresses at read, with no API contract change — the JSON shape served to the frontend is byte-identical.
+
+**Measured impact on real production data:**
+
+| column                       | before  | after   | ratio |
+|------------------------------|---------|---------|-------|
+| `matches.match_json`         | 19.2 KB | 2.8 KB  | 14.6% |
+| `profiles.trn_profile_json`  | 648 KB  | 28 KB   | 4.3%  |
+
+Profiles compress dramatically better than matches because the per-segment metadata (weapon names, vehicle imageUrls, stat `displayName` / `displayCategory` / `displayType` strings) is huge and repeats across every player.
+
+**On-disk format.** Each compressed blob carries a one-byte magic prefix (`0x01` = gzip-JSON, `0x00` reserved for explicit raw-JSON, `0x02+` reserved for future codecs). `app/storage_codec.py.unpack()` also recognizes the v0.0.4 shape (raw JSON with no prefix), so a freshly-restored v0.0.4 DB reads correctly even before the migration pass runs — the rollout is safe.
+
+**Migration.** `_init_db()` got a fourth idempotent cleanup pass that walks `matches` and `profiles`, finds rows whose blob does not start with the magic prefix, and rewrites them through `codec.pack()`. Same idempotent shape as the existing v0.0.4 cleanup passes — runs once on the first v0.0.5 boot, no-op afterwards. Logged row counts so operators can confirm it ran.
+
+**Single-source version.** `app/__init__.py.__version__` is now the only place the version string lives. `FastAPI(...)`, the `/ping` and `/status` JSON, the Dockerfile `LABEL`, and `build.sh`'s image tag and tarball filename all read from it. Bumping the version is one line; the new `build.sh` at the repo root automates the build/tag/save flow.
+
+`/ping` and `/status` now return a `version` field too, so the frontend (and the upcoming UK-primary / US-failover split) can verify which build it just hit.
 
 ### v0.0.4 — concurrency fix
 

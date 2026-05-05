@@ -1,6 +1,13 @@
 # syntax=docker/dockerfile:1.6
 FROM python:3.12-slim AS base
 
+# Stamped by build.sh from app/__init__.py.__version__ (single source of truth)
+# so `docker inspect bf6-tracker:<tag>` always reveals which build is running.
+# Falls back to "unknown" if the image is built without --build-arg.
+ARG BF6_VERSION=unknown
+LABEL org.opencontainers.image.title="bf6-tracker"
+LABEL org.opencontainers.image.version="${BF6_VERSION}"
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \

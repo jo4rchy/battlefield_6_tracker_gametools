@@ -12,6 +12,16 @@ services:
       # lock this down to your frontend origin(s) once it's deployed, e.g.:
       #   BF6_CORS_ORIGINS: "https://battlefieldtracker.joarchy.com,http://localhost:5173"
       BF6_CORS_ORIGINS: "*"
+      # v0.0.6: image-URL override dictionary. Lives in the data/ volume so
+      # you can edit it on the host without rebuilding; restart the container
+      # to pick up changes.
+      #   BF6_IMAGE_DICT_PATH: /app/data/image_dict.json   (default)
+      #   BF6_IMAGE_DICT_MODE: fallback                    (default — gametools
+      #                                                     first, dict only when
+      #                                                     gametools returns blank)
+      #     other modes:
+      #       override   — dict first, gametools as backup
+      #       off        — ignore the dict entirely
       TZ: Asia/Hong_Kong
     volumes:
       - ./data:/app/data

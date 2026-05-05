@@ -36,12 +36,14 @@ from fastapi.middleware.cors import CORSMiddleware
 
 try:
     # normal case: `uvicorn app.api:app` or `python -m app.api` from the repo root
+    from . import __version__
     from .converter import build_trn_profile, build_trn_matches_response, _pick_player_card
     from .main import GametoolsClient, StatsStorage
 except ImportError:
     # fallback for `python app/api.py` — inject the repo root onto sys.path
     import sys, pathlib
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+    from app import __version__
     from app.converter import build_trn_profile, build_trn_matches_response, _pick_player_card
     from app.main import GametoolsClient, StatsStorage
 
@@ -220,7 +222,7 @@ async def lifespan(app: FastAPI):
                 await task
 
 
-app = FastAPI(title="BF6 Tracker API", version="0.0.4.6", lifespan=lifespan)
+app = FastAPI(title="BF6 Tracker API", version=__version__, lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -236,13 +238,17 @@ app.add_middleware(
 
 @app.get("/ping")
 def ping() -> Dict[str, Any]:
-    return {"ok": True, "service": "bf6-tracker", "db": DB_PATH}
+    # `version` is sourced from app/__init__.py.__version__ — useful so the
+    # frontend can verify which backend (UK primary vs US failover) and which
+    # build it just hit, without having to scrape OpenAPI.
+    return {"ok": True, "service": "bf6-tracker", "version": __version__, "db": DB_PATH}
 
 
 @app.get("/status")
 def status() -> Dict[str, Any]:
     return {
         "service":  "bf6-tracker",
+        "version":  __version__,
         "db":       DB_PATH,
         "profiles": len(storage.list_profiles()),
         "poller":   _poll_state,
@@ -276,7 +282,7 @@ def search(
                 },
                 "userInfo": {
                     "countryCode": None,
-                    # v0.0.4.6: _pick_player_card tolerates the degraded
+                    # v0.0.4.7: _pick_player_card tolerates the degraded
                     # gametools shape where playerProfiles is empty and the
                     # data lives under other[*].playerProfiles[0].
                     "badges": (
@@ -425,64 +431,25 @@ if __name__ == "__main__":
 
 
 # =====================================================================
-# Docker cheat sheet — build an x86 (linux/amd64) image on a dev box,
-# export it as a tarball, load it on the NAS.
+# Build / release
 #
-# Run every command from the repo root (the folder containing this
-# Dockerfile / docker-compose.yml / app/ / requirements.txt).
+# The repo-root `build.sh` script automates building the linux/amd64
+# image, tagging it with the current `__version__`, and exporting a
+# `bf6-tracker-amd64-v<version>.tar` tarball ready to be copied to the
+# NAS. It reads the version from `app/__init__.py` so there is nothing
+# to keep in sync.
 #
-# ---------------------------------------------------------------------
-# 1) One-time: make sure buildx is ready for cross-arch builds
-# ---------------------------------------------------------------------
-#   docker buildx create --name bf6builder --use   # only the first time
-#   docker buildx inspect --bootstrap
+#   ./build.sh                  # build + tag + save tarball
+#   ./build.sh --push <registry>  # (optional) push instead of save
 #
-# ---------------------------------------------------------------------
-# 2) Build an x86-64 image locally (tag it bf6-tracker:latest)
-# ---------------------------------------------------------------------
-#   docker buildx build \
-#       --no-cache \
-#       --platform linux/amd64 \
-#       -t bf6-tracker:0.0.4.6 \
-#       --load \
-#       .
+# Deploy on the NAS:
 #
-#   # --no-cache forces every layer to rebuild from scratch — use this
-#   # when bumping the version so stale pip layers (or a cached copy of
-#   # the previous app/ source) don't sneak into the new image.
-#   # --load puts the image into the local docker image store so
-#   # `docker images` and `docker save` can see it. Don't use --push
-#   # unless you actually want to push to a registry.
+#   scp bf6-tracker-amd64-v<version>.tar user@nas:/volume1/docker/bf6-tracker/
+#   ssh user@nas "cd /volume1/docker/bf6-tracker \
+#                  && docker load -i bf6-tracker-amd64-v<version>.tar \
+#                  && docker compose up -d"
 #
-# ---------------------------------------------------------------------
-# 3) Export the image as a portable tarball
-# ---------------------------------------------------------------------
-#   docker save bf6-tracker:0.0.4.6 -o bf6-tracker-amd64-v0.0.4.6.tar
+# Inspect the running version:
 #
-#   # (optional) compress it if you're copying over a slow link
-#   gzip -9 bf6-tracker-amd64.tar       # -> bf6-tracker-amd64.tar.gz
-#
-# ---------------------------------------------------------------------
-# 4) Copy the tarball to the NAS and load it
-# ---------------------------------------------------------------------
-#   scp bf6-tracker-amd64.tar user@nas:/volume1/docker/bf6-tracker/
-#
-#   # on the NAS:
-#   cd /volume1/docker/bf6-tracker
-#   docker load -i bf6-tracker-amd64.tar
-#   # (gunzip first if you compressed it)
-#
-# ---------------------------------------------------------------------
-# 5) Start / restart the service on the NAS
-# ---------------------------------------------------------------------
-#   docker compose up -d                 # first time
-#   docker compose restart bf6-tracker   # after reloading a new image
-#   docker compose logs -f bf6-tracker   # follow logs
-#
-# ---------------------------------------------------------------------
-# All-in-one one-liner (dev box):
-# ---------------------------------------------------------------------
-#   docker buildx build --no-cache --platform linux/amd64 -t bf6-tracker:0.0.4.6 --load . \
-#     && docker save bf6-tracker:0.0.4.6 -o bf6-tracker-amd64.tar \
-#     && echo "built + exported -> bf6-tracker-amd64.tar"
+#   curl -s http://<nas>:8000/ping | jq .version
 # =====================================================================

@@ -17,6 +17,16 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+# v0.0.6: image-URL override dictionary. Loaded once at module import; see
+# app/image_dict.py for the file path / env-var contract. The two image
+# helpers below (_fmt_img + main._item_image) route every URL emission
+# through image_dict.resolve so operator overrides can fill in for
+# gametools' flaky CDN.
+try:
+    from . import image_dict as _image_dict
+except ImportError:
+    from app import image_dict as _image_dict  # type: ignore
+
 EPOCH_ZERO = "0001-01-01T00:00:00+00:00"
 
 # Names/ids that gametools uses for aggregate "sum of everything" rows.
@@ -144,7 +154,7 @@ def _fmt_time(seconds) -> str:
 
 
 # ------------------------------------------------------------------
-# v0.0.4.6: gametools' /player/playing endpoint sometimes returns a
+# v0.0.4.7: gametools' /player/playing endpoint sometimes returns a
 # degraded shape where the top-level `playerProfiles` array is empty
 # and the actual rank / badges payload is nested one level deeper
 # under `other[*].playerProfiles[0]`. In that fallback shape, the
@@ -300,7 +310,7 @@ def _overview_segment(stats: Dict[str, Any], profile: Optional[Dict[str, Any]]) 
     damage = _i(s.get("damage")) or (weapon_damage + vehicle_damage + gadget_damage)
 
     # rank from playerCard (from the profile endpoint).
-    # v0.0.4.6: route through _pick_player_card so we tolerate the degraded
+    # v0.0.4.7: route through _pick_player_card so we tolerate the degraded
     # gametools shape where playerProfiles is empty and the data lives under
     # other[*].playerProfiles[0] with badges/rank/rankImage inlined.
     rank_value = 0
@@ -410,21 +420,12 @@ def _overview_segment(stats: Dict[str, Any], profile: Optional[Dict[str, Any]]) 
 # ------------------------------------------------------------------
 
 def _fmt_img(item: Dict[str, Any]) -> str:
-    img = item.get("image") or item.get("altImage")
-    if img:
-        return img
-    
-    item_id = str(item.get("id", "")).strip().lower()
-    name = str(item.get("name", "")).strip()
-    class_name = str(item.get("className", "")).strip()
-    map_name = str(item.get("mapName", "")).strip()
-    
-    if item_id == "lvllvlmpsubsurface" or map_name == "Hagental Base":
-        return "https://image.battlefield.su/bf6/maps/hagental_base.jpg"
-    if item_id == "kit_kit_engineer" or class_name == "Engineer" or name == "Engineer":
-        return "https://image.battlefield.su/bf6/classes/white/Engineer.svg"
-    
-    return ""
+    # v0.0.6: every image-URL emission flows through image_dict.resolve()
+    # so operator-supplied overrides (data/image_dict.json) can fill in
+    # for gametools' flaky CDN. See app/image_dict.py for mode semantics.
+    gt = item.get("image") or item.get("altImage") or "" if isinstance(item, dict) else ""
+    item_id = item.get("id") if isinstance(item, dict) else None
+    return _image_dict.resolve(item_id, gt)
 
 
 def _gamemode_stats_block(it: Dict[str, Any]) -> Dict[str, Any]:
@@ -592,6 +593,7 @@ def _level_segments(stats: Dict[str, Any]) -> List[Dict[str, Any]]:
             },
         })
     return segs
+
 
 def _weapon_stats_block(it: Dict[str, Any]) -> Dict[str, Any]:
     kills = _i(it.get("kills"))
@@ -825,7 +827,7 @@ def _user_info(stats: Dict[str, Any], profile: Optional[Dict[str, Any]]) -> Dict
         "customAvatarFrameInfo": None,
         "premiumDuration": None,
         "socialAccounts": [],
-        # v0.0.4.6: _pick_player_card handles both the normal shape and the
+        # v0.0.4.7: _pick_player_card handles both the normal shape and the
         # degraded `other[*].playerProfiles[0]` fallback shape, and returns
         # an empty dict (never raises) when nothing is parseable.
         "badges": _i(_pick_player_card(profile).get("badges")) if profile else None,

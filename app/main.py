@@ -7,6 +7,18 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List, Tuple, Union
 
+# v0.0.5: gzip-compress the two big JSON blob columns (match_json,
+# trn_profile_json) at write time and decompress transparently at read.
+# See app/storage_codec.py for the on-disk encoding (magic-byte prefix lets
+# legacy v0.0.4 raw-JSON rows still read correctly until the migration pass
+# rewrites them).
+try:
+    from . import storage_codec as _codec
+    from . import image_dict as _image_dict
+except ImportError:
+    from app import storage_codec as _codec  # type: ignore
+    from app import image_dict as _image_dict  # type: ignore
+
 
 # ============================================================
 # 0) time helpers
@@ -281,24 +293,12 @@ def _item_name(it: Dict[str, Any], name_fields: List[str]) -> str:
     return str(it.get("id", ""))
 
 def _item_image(it: Dict[str, Any]) -> str:
+    # v0.0.6: route through image_dict.resolve() so operator overrides
+    # (data/image_dict.json) can fill in for gametools' flaky CDN.
     if not isinstance(it, dict):
         return ""
-    
-    img = it.get("image") or it.get("altImage")
-    if img:
-        return img
-    
-    item_id = str(it.get("id", "")).strip().lower()
-    name = str(it.get("name", "")).strip()
-    class_name = str(it.get("className", "")).strip()
-    map_name = str(it.get("mapName", "")).strip()
-    
-    if item_id == "lvllvlmpsubsurface" or map_name == "Hagental Base":
-        return "https://image.battlefield.su/bf6/maps/hagental_base.jpg"
-    if item_id == "kit_kit_engineer" or class_name == "Engineer" or name == "Engineer":
-        return "https://image.battlefield.su/bf6/classes/white/Engineer.svg"
-    
-    return ""
+    gt = it.get("image") or it.get("altImage") or ""
+    return _image_dict.resolve(it.get("id"), gt)
 
 
 # ---- overview delta ----
@@ -788,7 +788,10 @@ class StatsStorage:
             junk_ids: List[str] = []
             for row in cur.fetchall():
                 try:
-                    obj = json.loads(row["match_json"])
+                    # v0.0.5: codec.unpack handles both the new gzip-tagged rows
+                    # and any legacy raw-JSON rows that the migration pass
+                    # hasn't rewritten yet (cleanup runs before the migration).
+                    obj = _codec.unpack(row["match_json"])
                 except Exception:
                     continue  # leave unparseable rows alone
                 if _is_zero_delta_match(obj):
@@ -826,6 +829,99 @@ class StatsStorage:
             )
         except sqlite3.OperationalError as e:
             print(f"[StatsStorage] matches transition index creation skipped: {e}")
+
+        # v0.0.5 storage compression migration: rewrite every legacy raw-JSON
+        # row in `matches.match_json` and `profiles.trn_profile_json` through
+        # storage_codec.pack() so it lands as a gzip-compressed blob with the
+        # 0x01 magic byte. Reads have already been wired through codec.unpack
+        # which transparently handles both the new and the legacy shapes, so
+        # the API stays correct throughout the migration; the sole effect of
+        # this pass is that on-disk size shrinks by ~7× as legacy rows are
+        # replaced.
+        #
+        # Idempotent. _codec.is_packed() returns True iff a row already has
+        # the new magic byte, so on a clean v0.0.5 DB this loop walks the
+        # rows once and writes nothing. On a v0.0.4 DB it rewrites every
+        # row exactly once. Subsequent boots are no-ops.
+        #
+        # We commit per-batch (per-table) rather than per-row to keep WAL
+        # churn down on big DBs without holding a single huge transaction
+        # if the process is killed mid-migration. UPDATE rows by primary
+        # key so we don't rely on rowid stability.
+        total_rewrites = 0
+        for table, key_col, blob_col in (
+            ("matches",  "id",                       "match_json"),
+            ("profiles", "platform_user_identifier", "trn_profile_json"),
+        ):
+            try:
+                cur.execute(f"SELECT {key_col}, {blob_col} FROM {table}")
+                rewrites: List[Tuple[bytes, str]] = []
+                for row in cur.fetchall():
+                    blob = row[blob_col]
+                    if _codec.is_packed(blob):
+                        continue
+                    try:
+                        obj = _codec.unpack(blob)
+                    except Exception as e:
+                        # Genuinely-unparseable row — leave it alone, log and
+                        # move on. This is extremely unlikely (every row was
+                        # written by json.dumps in v0.0.4) but we never want
+                        # the migration to crash the whole startup.
+                        print(
+                            f"[StatsStorage] v0.0.5 migration: could not "
+                            f"decode {table}.{blob_col} for {key_col}={row[key_col]!r}: {e}"
+                        )
+                        continue
+                    rewrites.append((_codec.pack(obj), row[key_col]))
+                if rewrites:
+                    cur.executemany(
+                        f"UPDATE {table} SET {blob_col} = ? WHERE {key_col} = ?",
+                        rewrites,
+                    )
+                    self.conn.commit()
+                    total_rewrites += len(rewrites)
+                    print(
+                        f"[StatsStorage] v0.0.5 compression migration: "
+                        f"rewrote {len(rewrites)} row(s) in {table}.{blob_col}"
+                    )
+            except sqlite3.OperationalError as e:
+                # Table missing or column missing on an unusual DB shape —
+                # don't block startup, just log.
+                print(f"[StatsStorage] v0.0.5 migration skipped for {table}: {e}")
+
+        # Reclaim the freed pages on disk. SQLite UPDATE leaves the bytes the
+        # row used to occupy as free space inside the file — without VACUUM
+        # the .db file size doesn't drop even though the logical rows shrank
+        # by ~7×, which is the whole point of this migration. We only run
+        # VACUUM when the migration actually rewrote something so subsequent
+        # boots (where every row is already packed) stay instant.
+        #
+        # VACUUM rebuilds the entire DB file and needs ~2× the file size in
+        # free disk during the operation. Both v0.0.4 and v0.0.5 DBs have
+        # plenty of headroom for this on the production VPS (~250MB → ~50MB
+        # peak during VACUUM).
+        #
+        # Note: VACUUM cannot run inside a transaction. We've already
+        # committed every per-table batch above, so the connection is in
+        # autocommit-ish state and VACUUM just works.
+        if total_rewrites > 0:
+            try:
+                print(
+                    f"[StatsStorage] v0.0.5 compression migration: running "
+                    f"VACUUM to reclaim freed pages (this rebuilds the DB file)..."
+                )
+                self.conn.execute("VACUUM")
+                print("[StatsStorage] v0.0.5 compression migration: VACUUM done")
+            except sqlite3.OperationalError as e:
+                # If VACUUM fails (e.g. DB busy, disk full) the data is
+                # still correct — just the file size hasn't shrunk yet.
+                # Operator can run VACUUM manually later via the sqlite3
+                # CLI. Don't crash startup.
+                print(
+                    f"[StatsStorage] v0.0.5 compression migration: VACUUM "
+                    f"failed ({e}). Data is correct; rerun "
+                    f"`sqlite3 {self.db_path} 'VACUUM'` to reclaim disk."
+                )
 
     # ---- snapshots ----
     def get_latest_snapshot(self, name: str, platform: str = "steam") -> Optional[Dict[str, Any]]:
@@ -904,7 +1000,7 @@ class StatsStorage:
             mid, name, platform, created_at,
             from_hash, to_hash,
             str(account_id) if account_id is not None else None,
-            json.dumps(match_obj, ensure_ascii=False)
+            _codec.pack(match_obj),
         ))
         self.conn.commit()
         return mid
@@ -927,7 +1023,7 @@ class StatsStorage:
             LIMIT ? OFFSET ?
         """, (name, platform, limit, offset))
         rows = cur.fetchall()
-        return [json.loads(r["match_json"]) for r in rows]
+        return [_codec.unpack(r["match_json"]) for r in rows]
 
     def build_matches_response(self, name: str, platform: str = "steam", limit: int = 20, offset: int = 0) -> Dict[str, Any]:
         return {"data": {"matches": self.list_matches(name, platform, limit, offset)}}
@@ -1017,7 +1113,7 @@ class StatsStorage:
             "name":                    row["name"],
             "updateHash":              row["update_hash"],
             "updatedAt":               row["updated_at"],
-            "trnProfile":              json.loads(row["trn_profile_json"]),
+            "trnProfile":              _codec.unpack(row["trn_profile_json"]),
         }
 
     def list_profiles(self) -> List[Dict[str, Any]]:
@@ -1069,7 +1165,7 @@ class StatsStorage:
             name,
             update_hash,
             updated_at,
-            json.dumps(trn_profile, ensure_ascii=False),
+            _codec.pack(trn_profile),
         ))
         self.conn.commit()
 
@@ -1108,7 +1204,7 @@ class StatsStorage:
             created_at,
             from_hash,
             to_hash,
-            json.dumps(match_obj, ensure_ascii=False),
+            _codec.pack(match_obj),
         ))
         inserted = cur.rowcount > 0
         if not inserted:
@@ -1144,7 +1240,7 @@ class StatsStorage:
             ORDER BY created_at DESC
             LIMIT ? OFFSET ?
         """, (str(platform_user_identifier), limit, offset))
-        return [json.loads(r["match_json"]) for r in cur.fetchall()]
+        return [_codec.unpack(r["match_json"]) for r in cur.fetchall()]
 
     def count_profile_matches(self, platform_user_identifier: str) -> int:
         cur = self.conn.cursor()
