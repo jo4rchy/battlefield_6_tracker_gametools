@@ -49,6 +49,11 @@ import json
 import os
 from typing import Dict, Optional
 
+try:
+    from .logging_utils import log_event
+except ImportError:
+    from app.logging_utils import log_event  # type: ignore
+
 # ---------------------------------------------------------------------------
 # Config — read once at module import. Changing env after start has no effect
 # until the container restarts (see module docstring).
@@ -64,9 +69,12 @@ MODE: str = (os.environ.get("BF6_IMAGE_DICT_MODE") or "fallback").strip().lower(
 
 _VALID_MODES = ("fallback", "override", "off")
 if MODE not in _VALID_MODES:
-    print(
-        f"[image_dict] WARNING: BF6_IMAGE_DICT_MODE={MODE!r} is not one of "
-        f"{_VALID_MODES} — defaulting to 'fallback'."
+    log_event(
+        "WARN",
+        "image_dict.invalid_mode",
+        mode=MODE,
+        valid=",".join(_VALID_MODES),
+        fallback="fallback",
     )
     MODE = "fallback"
 
@@ -95,16 +103,20 @@ def _load_dict(path: str) -> Dict[str, str]:
             return {}
         data = json.loads(raw)
     except (OSError, json.JSONDecodeError) as e:
-        print(
-            f"[image_dict] WARNING: could not load {path!r} ({e}); "
-            f"image overrides disabled until file is fixed."
+        log_event(
+            "WARN",
+            "image_dict.load_failed",
+            path=path,
+            error=str(e),
         )
         return {}
 
     if not isinstance(data, dict):
-        print(
-            f"[image_dict] WARNING: {path!r} top-level value is "
-            f"{type(data).__name__}, not an object; image overrides disabled."
+        log_event(
+            "WARN",
+            "image_dict.invalid_shape",
+            path=path,
+            type=type(data).__name__,
         )
         return {}
 
@@ -124,12 +136,9 @@ _OVERRIDES: Dict[str, str] = _load_dict(DICT_PATH)
 # the feature is active without grepping for it. Quiet when nothing is
 # loaded so we don't spam logs for users who never opted in.
 if MODE != "off" and _OVERRIDES:
-    print(
-        f"[image_dict] loaded {len(_OVERRIDES)} override(s) from {DICT_PATH} "
-        f"(mode={MODE})"
-    )
+    log_event("INFO", "image_dict.loaded", overrides=len(_OVERRIDES), path=DICT_PATH, mode=MODE)
 elif MODE == "off":
-    print("[image_dict] mode=off — overrides disabled")
+    log_event("INFO", "image_dict.disabled", mode=MODE)
 
 
 # ---------------------------------------------------------------------------

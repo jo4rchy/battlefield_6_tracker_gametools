@@ -1,9 +1,12 @@
 import requests
 import hashlib
 import json
+import os
 import sqlite3
 import threading
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List, Tuple, Union
 
@@ -15,9 +18,11 @@ from typing import Optional, Dict, Any, List, Tuple, Union
 try:
     from . import storage_codec as _codec
     from . import image_dict as _image_dict
+    from .logging_utils import log_event
 except ImportError:
     from app import storage_codec as _codec  # type: ignore
     from app import image_dict as _image_dict  # type: ignore
+    from app.logging_utils import log_event  # type: ignore
 
 
 # ============================================================
@@ -26,6 +31,12 @@ except ImportError:
 
 def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _clean_param(value: Optional[Any]) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
 
 
 def _is_zero_delta_match(match_obj: Dict[str, Any]) -> bool:
@@ -79,11 +90,26 @@ class GametoolsClient:
     def __init__(self):
         self.base_url_profile = "https://api.gametools.network/bf6/profile/"
         self.base_url_stats = "https://api.gametools.network/bf6/stats/"
+        # Batched stats endpoint — accepts up to 128 players per POST request.
+        # Returns the same per-player stats payload shape as /bf6/stats/, wrapped
+        # in {"data": [item, item, ...]}. Used by the background poller via
+        # fetch_stats_batch_by_ids() to avoid per-player request fanout.
+        self.base_url_stats_multi = "https://api.gametools.network/bf6/multiple/"
         self.params = {
             "raw": "false",
             "format_values": "true",
             "skip_battlelog": "true"
         }
+        # Keep-alive Session avoids a TCP/TLS handshake per request — a big
+        # win on the poller path which otherwise opens 2 connections per
+        # player. Session.get/Session.post are documented thread-safe for
+        # independent requests, so the poller can call this from a
+        # ThreadPoolExecutor without locking.
+        self._session = requests.Session()
+        self._session.headers.update({
+            "Accept": "application/json",
+            "User-Agent": "bf6-tracker-backend/0.0.7.8",
+        })
 
     def _apply_corrections(self, data_stats: Dict[str, Any]) -> Dict[str, Any]:
         """Correct the buggy aggregate secondsPlayed reported by gametools by
@@ -108,83 +134,383 @@ class GametoolsClient:
 
             return data_stats
         except Exception as e:
-            print(f"[GametoolsClient._apply_corrections] Error: {e}")
+            log_event("WARN", "gametools.correction_failed", error=type(e).__name__)
             return data_stats
 
-    def fetch_stats(self, name: str, platform: str = "steam") -> Optional[Dict[str, Any]]:
+    def fetch_stats(self, name: str, platform: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """Fetch gametools /bf6/stats/ by player name (corrected)."""
-        params = {**self.params, "name": name, "platform": platform}
+        params = {**self.params, "name": name}
+        if _clean_param(platform):
+            params["platform"] = _clean_param(platform)
         try:
-            r = requests.get(self.base_url_stats, params=params, timeout=10)
+            r = self._session.get(self.base_url_stats, params=params, timeout=10)
             r.raise_for_status()
             return self._apply_corrections(r.json())
-        except Exception as e:
-            print(f"[GametoolsClient.fetch_stats] Error: {e}")
+        except Exception:
             return None
 
-    def fetch_profile(self, name: str, platform: str = "steam") -> Optional[Dict[str, Any]]:
+    def fetch_profile(self, name: str, platform: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """Fetch gametools /bf6/profile/ by player name (rank / playerCard metadata)."""
-        params = {**self.params, "name": name, "platform": platform}
+        params = {**self.params, "name": name}
+        if _clean_param(platform):
+            params["platform"] = _clean_param(platform)
         try:
-            r = requests.get(self.base_url_profile, params=params, timeout=10)
+            r = self._session.get(self.base_url_profile, params=params, timeout=10)
             r.raise_for_status()
             return r.json()
-        except Exception as e:
-            print(f"[GametoolsClient.fetch_profile] Error: {e}")
+        except Exception:
             return None
 
-    def fetch_stats_by_id(self, player_id: Union[str, int], platform: str = "steam") -> Optional[Dict[str, Any]]:
+    def fetch_stats_by_id(
+        self,
+        player_id: Union[str, int],
+        platform: Optional[str] = None,
+        name: Optional[str] = None,  # accepted for caller compatibility — see note
+    ) -> Optional[Dict[str, Any]]:
         """Fetch gametools /bf6/stats/ keyed by nucleus/player id. Preferred for the
-        background poller because it is stable across name changes."""
+        background poller because it is stable across name changes.
+
+        IMPORTANT: `name` is accepted for caller compatibility but intentionally
+        NOT forwarded to gametools. The upstream service echoes the `name`
+        query back as `userName` in the response, which let URL-tampered names
+        slip into the canonical store. The api layer resolves the display
+        name out-of-band via _resolve_canonical_name (see api.py).
+        """
         params = {
             **self.params,
             "playerid":  str(player_id),
             "nucleus_id": str(player_id),
-            "platform":  platform,
         }
+        if _clean_param(platform):
+            params["platform"] = _clean_param(platform)
+        # Deliberately not forwarding `name` to gametools. See docstring.
         try:
-            r = requests.get(self.base_url_stats, params=params, timeout=10)
+            r = self._session.get(self.base_url_stats, params=params, timeout=10)
             r.raise_for_status()
             return self._apply_corrections(r.json())
-        except Exception as e:
-            print(f"[GametoolsClient.fetch_stats_by_id] Error: {e}")
+        except Exception:
             return None
 
-    def fetch_profile_by_id(self, player_id: Union[str, int], platform: str = "steam") -> Optional[Dict[str, Any]]:
-        """Fetch gametools /bf6/profile/ keyed by nucleus/player id."""
+    def fetch_profile_by_id(
+        self,
+        player_id: Union[str, int],
+        platform: Optional[str] = None,
+        name: Optional[str] = None,  # accepted for caller compatibility — see fetch_stats_by_id
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch gametools /bf6/profile/ keyed by nucleus/player id.
+
+        `name` is accepted but not forwarded — see fetch_stats_by_id for why.
+        """
         params = {
             **self.params,
             "playerid":  str(player_id),
             "nucleus_id": str(player_id),
-            "platform":  platform,
         }
+        if _clean_param(platform):
+            params["platform"] = _clean_param(platform)
+        # Deliberately not forwarding `name` to gametools. See fetch_stats_by_id.
         try:
-            r = requests.get(self.base_url_profile, params=params, timeout=10)
+            r = self._session.get(self.base_url_profile, params=params, timeout=10)
             r.raise_for_status()
             return r.json()
-        except Exception as e:
-            print(f"[GametoolsClient.fetch_profile_by_id] Error: {e}")
+        except Exception:
             return None
 
-    def fetch_full(self, name: str, platform: str = "steam") -> Dict[str, Any]:
+    def fetch_full(self, name: str, platform: Optional[str] = None) -> Dict[str, Any]:
         """Fetch both stats + profile in one call (by name); either may be None on error."""
         return {
             "stats": self.fetch_stats(name, platform),
             "profile": self.fetch_profile(name, platform),
         }
 
-    def fetch_full_by_id(self, player_id: Union[str, int], platform: str = "steam") -> Dict[str, Any]:
+    def fetch_full_by_id(
+        self,
+        player_id: Union[str, int],
+        platform: Optional[str] = None,
+        name: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Fetch both stats + profile in one call (by id); either may be None on error."""
         return {
-            "stats": self.fetch_stats_by_id(player_id, platform),
-            "profile": self.fetch_profile_by_id(player_id, platform),
+            "stats": self.fetch_stats_by_id(player_id, platform, name=name),
+            "profile": self.fetch_profile_by_id(player_id, platform, name=name),
         }
-        
-    def fetch_stats_mock_old(self, name: str, platform: str = "steam") -> Optional[Dict[str, Any]]:
+
+    # --- batched stats fetch -------------------------------------------------
+    # /bf6/multiple/ accepts a JSON array of {player_id, user_id, platform}
+    # and returns {"data": [stats, ...]}. The upstream cap is 128 entries
+    # per request. The poller uses this to refresh 1000+ players in a handful
+    # of round-trips instead of 2 round-trips per player.
+
+    BATCH_STATS_MAX = 128
+
+    def fetch_stats_batch_by_ids(
+        self,
+        items: List[Dict[str, Any]],
+        chunk_size: int = BATCH_STATS_MAX,
+        max_workers: int = 1,
+        timeout: int = 30,
+        stagger_seconds: float = 0.0,
+    ) -> Dict[str, Optional[Dict[str, Any]]]:
+        """Batch-fetch corrected stats for many players via /bf6/multiple/.
+
+        ``items`` must be an iterable of dicts with at least ``player_id`` and
+        ``platform`` keys (``user_id`` is auto-filled from ``player_id`` when
+        absent — the upstream API expects both fields and uses identical
+        values for them).
+
+        Returns a mapping of ``str(player_id) -> stats_payload`` for every id
+        that appeared in the input. Players whose lookup failed (network
+        error, upstream omission) map to ``None`` so callers can distinguish
+        "not refreshed" from "refreshed but no movement". The mapping
+        preserves the corrections that ``fetch_stats_by_id`` would apply.
+
+        ``chunk_size`` is bounded to ``BATCH_STATS_MAX`` (128). ``max_workers``
+        controls how many chunks are POSTed concurrently; values >1 use a
+        ThreadPoolExecutor over ``self._session`` (Session is thread-safe for
+        independent requests). ``timeout`` is per-chunk. ``stagger_seconds``
+        sleeps between sequential requests and rescue requests.
+        """
+        if not items:
+            return {}
+
+        chunk_size = max(1, min(int(chunk_size or 1), self.BATCH_STATS_MAX))
+        max_workers = max(1, int(max_workers or 1))
+        stagger_seconds = max(0.0, float(stagger_seconds or 0.0))
+        log_success = os.environ.get("BF6_POLL_LOG_BATCH_SUCCESS", "false").strip().lower() in ("1", "true", "yes", "on")
+        retry_statuses = {429, 500, 502, 503, 504}
+        retry_delays = [1.0, 3.0]
+
+        # Normalize: dedupe by player_id, drop empties, build {pid: platform}
+        seen: Dict[str, Dict[str, str]] = {}
+        for it in items:
+            pid = _clean_param((it or {}).get("player_id") or (it or {}).get("user_id"))
+            if not pid:
+                continue
+            platform = _clean_param((it or {}).get("platform"))
+            seen.setdefault(pid, {"player_id": pid, "user_id": pid, "platform": platform})
+
+        ordered = list(seen.values())
+        if not ordered:
+            return {}
+
+        # Default-fail every requested id so callers can detect missing entries.
+        out: Dict[str, Optional[Dict[str, Any]]] = {pid: None for pid in seen.keys()}
+
+        # Match the curl sample's query string exactly — categories=multiplayer
+        # is what makes the response shape mirror /bf6/stats/.
+        params = {
+            "categories":     "multiplayer",
+            "raw":            "false",
+            "format_values":  "true",
+            "seperation":     "false",
+            "lang":           "en-us",
+        }
+
+        def _chunk_sample_ids(chunk: List[Dict[str, str]], limit: int = 5) -> str:
+            return ",".join(str(item.get("player_id") or "") for item in chunk[:limit])
+
+        def _response_snippet(response: Optional[requests.Response], limit: int = 500) -> Optional[str]:
+            if response is None:
+                return None
+            text = (response.text or "").replace("\n", " ").replace("\r", " ").strip()
+            return text[:limit] if text else None
+
+        def _post_chunk(
+            chunk: List[Dict[str, str]],
+            *,
+            rescue: bool = False,
+        ) -> Tuple[List[Tuple[str, Optional[Dict[str, Any]]]], bool]:
+            payload = [
+                {
+                    "player_id": int(item["player_id"]) if str(item["player_id"]).isdigit() else item["player_id"],
+                    "user_id":   int(item["user_id"])   if str(item["user_id"]).isdigit()   else item["user_id"],
+                    "platform":  item.get("platform") or "",
+                }
+                for item in chunk
+            ]
+
+            body: Any = None
+            attempts = len(retry_delays) + 1
+            for attempt in range(attempts):
+                try:
+                    r = self._session.post(
+                        self.base_url_stats_multi,
+                        params=params,
+                        json=payload,
+                        timeout=timeout,
+                    )
+                    r.raise_for_status()
+                    body = r.json()
+                    break
+                except requests.HTTPError as e:
+                    response = e.response
+                    status_code = getattr(response, "status_code", None)
+                    if status_code in retry_statuses and attempt < len(retry_delays):
+                        delay = retry_delays[attempt]
+                        log_event(
+                            "WARN",
+                            "gametools.batch_stats_chunk_retry",
+                            chunkSize=len(chunk),
+                            sampleIds=_chunk_sample_ids(chunk),
+                            attempt=attempt + 1,
+                            retryInSec=delay,
+                            rescue=rescue,
+                            error=type(e).__name__,
+                            statusCode=status_code,
+                            reason=getattr(response, "reason", None),
+                        )
+                        time.sleep(delay)
+                        continue
+                    log_event(
+                        "WARN",
+                        "gametools.batch_stats_chunk_failed",
+                        chunkSize=len(chunk),
+                        sampleIds=_chunk_sample_ids(chunk),
+                        attempts=attempt + 1,
+                        rescue=rescue,
+                        error=type(e).__name__,
+                        statusCode=status_code,
+                        reason=getattr(response, "reason", None),
+                        response=_response_snippet(response),
+                    )
+                    return [], False
+                except (requests.Timeout, requests.ConnectionError) as e:
+                    if attempt < len(retry_delays):
+                        delay = retry_delays[attempt]
+                        log_event(
+                            "WARN",
+                            "gametools.batch_stats_chunk_retry",
+                            chunkSize=len(chunk),
+                            sampleIds=_chunk_sample_ids(chunk),
+                            attempt=attempt + 1,
+                            retryInSec=delay,
+                            rescue=rescue,
+                            error=type(e).__name__,
+                        )
+                        time.sleep(delay)
+                        continue
+                    log_event(
+                        "WARN",
+                        "gametools.batch_stats_chunk_failed",
+                        chunkSize=len(chunk),
+                        sampleIds=_chunk_sample_ids(chunk),
+                        attempts=attempt + 1,
+                        rescue=rescue,
+                        error=type(e).__name__,
+                    )
+                    return [], False
+                except Exception as e:
+                    log_event(
+                        "WARN",
+                        "gametools.batch_stats_chunk_failed",
+                        chunkSize=len(chunk),
+                        sampleIds=_chunk_sample_ids(chunk),
+                        attempts=attempt + 1,
+                        rescue=rescue,
+                        error=type(e).__name__,
+                    )
+                    return [], False
+
+            data = body.get("data") if isinstance(body, dict) else body
+            if not isinstance(data, list) and isinstance(body, dict) and (body.get("userId") or body.get("id")):
+                # GameTools returns a bare stats object instead of {"data": [...]}
+                # when /bf6/multiple/ is called with exactly one player.
+                data = [body]
+            if not isinstance(data, list):
+                log_event(
+                    "WARN",
+                    "gametools.batch_stats_unexpected_shape",
+                    chunkSize=len(chunk),
+                    sampleIds=_chunk_sample_ids(chunk),
+                    bodyType=type(body).__name__,
+                    keys=",".join(sorted(str(k) for k in body.keys())[:12]) if isinstance(body, dict) else None,
+                )
+                return [], False
+
+            if log_success or rescue:
+                log_event(
+                    "INFO",
+                    "gametools.batch_stats_chunk_succeeded",
+                    chunkSize=len(chunk),
+                    resultCount=len(data),
+                    sampleIds=_chunk_sample_ids(chunk),
+                    rescue=rescue,
+                )
+
+            results: List[Tuple[str, Optional[Dict[str, Any]]]] = []
+            for stats in data:
+                if not isinstance(stats, dict):
+                    continue
+                # Identify which input pid this row corresponds to. The
+                # upstream echoes `id`/`userId` and (some platforms aside)
+                # preserves request order; we trust the explicit id over
+                # positional matching to be safe against missing/dropped rows.
+                pid = _clean_param(stats.get("userId") or stats.get("id"))
+                if not pid:
+                    continue
+                results.append((pid, self._apply_corrections(stats)))
+            return results, True
+
+        def _apply_results(chunk_results: List[Tuple[str, Optional[Dict[str, Any]]]]) -> int:
+            applied = 0
+            for pid, stats in chunk_results:
+                if pid in out:
+                    out[pid] = stats
+                    applied += 1
+            return applied
+
+        chunks = [ordered[i:i + chunk_size] for i in range(0, len(ordered), chunk_size)]
+        failed_chunks: List[List[Dict[str, str]]] = []
+
+        if max_workers > 1 and len(chunks) > 1:
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                for chunk, (chunk_results, ok) in zip(chunks, pool.map(_post_chunk, chunks)):
+                    if ok:
+                        _apply_results(chunk_results)
+                    else:
+                        failed_chunks.append(chunk)
+        else:
+            for idx, chunk in enumerate(chunks):
+                chunk_results, ok = _post_chunk(chunk)
+                if ok:
+                    _apply_results(chunk_results)
+                else:
+                    failed_chunks.append(chunk)
+                if stagger_seconds and idx < len(chunks) - 1:
+                    time.sleep(stagger_seconds)
+
+        if failed_chunks:
+            log_event(
+                "WARN",
+                "gametools.batch_stats_rescue_started",
+                chunks=len(failed_chunks),
+                players=sum(len(chunk) for chunk in failed_chunks),
+            )
+            recovered = 0
+            still_failed = 0
+            for idx, chunk in enumerate(failed_chunks):
+                chunk_results, ok = _post_chunk(chunk, rescue=True)
+                if ok:
+                    recovered += _apply_results(chunk_results)
+                else:
+                    still_failed += len(chunk)
+                if stagger_seconds and idx < len(failed_chunks) - 1:
+                    time.sleep(stagger_seconds)
+            log_event(
+                "INFO",
+                "gametools.batch_stats_rescue_summary",
+                chunks=len(failed_chunks),
+                recovered=recovered,
+                stillFailed=still_failed,
+            )
+
+        return out
+
+    def fetch_stats_mock_old(self, name: str, platform: str = "") -> Optional[Dict[str, Any]]:
         data = json.load(open("old.json", "r", encoding="utf-8"))
         return data
     
-    def fetch_stats_mock_new(self, name: str, platform: str = "steam") -> Optional[Dict[str, Any]]:
+    def fetch_stats_mock_new(self, name: str, platform: str = "") -> Optional[Dict[str, Any]]:
         data = json.load(open("new.json", "r", encoding="utf-8"))
         return data
     
@@ -673,6 +999,12 @@ class StatsStorage:
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        # Global RLock that serializes ALL database access. SQLite only
+        # supports one writer at a time, and sharing a single connection
+        # across FastAPI's threadpool + the background poller causes
+        # sqlite3.InterfaceError when two threads hit the connection
+        # concurrently. Every public method must acquire this lock.
+        self._db_lock = threading.RLock()
         # Per-identifier RLock used to serialize the read-existing → compare →
         # save-match → save-profile flow inside upsert_profile_with_delta. This
         # prevents two concurrent /profile (or poller) calls for the same user
@@ -705,6 +1037,7 @@ class StatsStorage:
         cur.executescript("""
         PRAGMA journal_mode=WAL;
         PRAGMA synchronous=NORMAL;
+        PRAGMA foreign_keys=ON;
 
         -- profiles: one row per player keyed by platformUserIdentifier.
         -- Stores the current converted TRN profile JSON; overwritten on change.
@@ -736,6 +1069,19 @@ class StatsStorage:
         CREATE INDEX IF NOT EXISTS idx_matches_to_hash
         ON matches(platform_user_identifier, to_hash);
 
+        -- Cached public counter snapshots. The API recalculates these on a
+        -- timer instead of counting large tables on every frontend request.
+        CREATE TABLE IF NOT EXISTS tracked_count_history (
+            id TEXT PRIMARY KEY,
+            calculated_at TEXT NOT NULL,
+            players_tracked INTEGER NOT NULL,
+            matches_tracked INTEGER NOT NULL,
+            calculation_ms INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_tracked_count_history_time
+        ON tracked_count_history(calculated_at DESC);
+
         -- legacy snapshots table preserved for back-compat; unused by new flow.
         CREATE TABLE IF NOT EXISTS snapshots (
             id TEXT PRIMARY KEY,
@@ -746,6 +1092,59 @@ class StatsStorage:
             account_id TEXT,
             data_json TEXT NOT NULL
         );
+
+        -- Suspicion reports: one anonymous reporter can mark one player once
+        -- per UTC day. Reporter identity is supplied by the API layer as a
+        -- signed anonymous cookie key, not an authenticated account id.
+        CREATE TABLE IF NOT EXISTS player_suspicion_reports (
+            id TEXT PRIMARY KEY,
+            target_platform_user_identifier TEXT NOT NULL,
+            reporter_key TEXT NOT NULL,
+            report_date TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            reporter_ip_hash TEXT,
+            cf_ray TEXT,
+            user_agent_hash TEXT,
+            UNIQUE(target_platform_user_identifier, reporter_key, report_date)
+        );
+
+        CREATE TABLE IF NOT EXISTS player_suspicion_report_types (
+            report_id TEXT NOT NULL,
+            type TEXT NOT NULL,
+            PRIMARY KEY(report_id, type),
+            FOREIGN KEY(report_id)
+                REFERENCES player_suspicion_reports(id)
+                ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_sus_reports_target_time
+        ON player_suspicion_reports(target_platform_user_identifier, created_at);
+
+        CREATE INDEX IF NOT EXISTS idx_sus_reports_reporter_time
+        ON player_suspicion_reports(reporter_key, created_at);
+
+        CREATE INDEX IF NOT EXISTS idx_sus_report_types_type
+        ON player_suspicion_report_types(type);
+
+        -- Attempt log used for application-level rate limiting. This records
+        -- POST attempts, including duplicate same-day marks, so repeated spam
+        -- cannot avoid limits by hitting the UNIQUE report constraint.
+        CREATE TABLE IF NOT EXISTS player_suspicion_rate_events (
+            id TEXT PRIMARY KEY,
+            reporter_key TEXT NOT NULL,
+            reporter_ip_hash TEXT,
+            target_platform_user_identifier TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_sus_rate_reporter_time
+        ON player_suspicion_rate_events(reporter_key, created_at);
+
+        CREATE INDEX IF NOT EXISTS idx_sus_rate_ip_time
+        ON player_suspicion_rate_events(reporter_ip_hash, created_at);
+
+        CREATE INDEX IF NOT EXISTS idx_sus_rate_target_time
+        ON player_suspicion_rate_events(target_platform_user_identifier, created_at);
         """)
         self.conn.commit()
 
@@ -769,9 +1168,9 @@ class StatsStorage:
             removed = cur.rowcount or 0
             self.conn.commit()
             if removed > 0:
-                print(f"[StatsStorage] cleanup: removed {removed} duplicate match row(s) from v0.0.2 race")
+                log_event("INFO", "storage.cleanup_duplicate_matches", removed=removed)
         except sqlite3.OperationalError as e:
-            print(f"[StatsStorage] duplicate-match cleanup skipped: {e}")
+            log_event("WARN", "storage.cleanup_duplicate_matches_skipped", error=str(e))
 
         # v0.0.4 cleanup pass #2: remove "zero-delta" junk matches — rows where
         # every overview counter is 0 and every per-group metadata bucket is
@@ -802,9 +1201,9 @@ class StatsStorage:
                     [(mid,) for mid in junk_ids],
                 )
                 self.conn.commit()
-                print(f"[StatsStorage] cleanup: removed {len(junk_ids)} zero-delta match row(s) (no counter movement)")
+                log_event("INFO", "storage.cleanup_zero_delta_matches", removed=len(junk_ids))
         except sqlite3.OperationalError as e:
-            print(f"[StatsStorage] zero-delta-match cleanup skipped: {e}")
+            log_event("WARN", "storage.cleanup_zero_delta_matches_skipped", error=str(e))
 
         # v0.0.4 defense-in-depth: a UNIQUE expression index on
         # (platform_user_identifier, COALESCE(from_hash,''), to_hash) ensures
@@ -822,13 +1221,9 @@ class StatsStorage:
             """)
             self.conn.commit()
         except sqlite3.IntegrityError as e:
-            print(
-                "[StatsStorage] could NOT create UNIQUE matches transition index "
-                f"(unexpected duplicates remain after cleanup): {e}. "
-                "In-process per-user lock will still prevent any NEW duplicates."
-            )
+            log_event("ERROR", "storage.unique_index_failed", error=str(e))
         except sqlite3.OperationalError as e:
-            print(f"[StatsStorage] matches transition index creation skipped: {e}")
+            log_event("WARN", "storage.unique_index_skipped", error=str(e))
 
         # v0.0.5 storage compression migration: rewrite every legacy raw-JSON
         # row in `matches.match_json` and `profiles.trn_profile_json` through
@@ -867,9 +1262,13 @@ class StatsStorage:
                         # move on. This is extremely unlikely (every row was
                         # written by json.dumps in v0.0.4) but we never want
                         # the migration to crash the whole startup.
-                        print(
-                            f"[StatsStorage] v0.0.5 migration: could not "
-                            f"decode {table}.{blob_col} for {key_col}={row[key_col]!r}: {e}"
+                        log_event(
+                            "WARN",
+                            "storage.compression_decode_failed",
+                            table=table,
+                            column=blob_col,
+                            key=row[key_col],
+                            error=str(e),
                         )
                         continue
                     rewrites.append((_codec.pack(obj), row[key_col]))
@@ -880,14 +1279,17 @@ class StatsStorage:
                     )
                     self.conn.commit()
                     total_rewrites += len(rewrites)
-                    print(
-                        f"[StatsStorage] v0.0.5 compression migration: "
-                        f"rewrote {len(rewrites)} row(s) in {table}.{blob_col}"
+                    log_event(
+                        "INFO",
+                        "storage.compression_rewrite",
+                        table=table,
+                        column=blob_col,
+                        rows=len(rewrites),
                     )
             except sqlite3.OperationalError as e:
                 # Table missing or column missing on an unusual DB shape —
                 # don't block startup, just log.
-                print(f"[StatsStorage] v0.0.5 migration skipped for {table}: {e}")
+                log_event("WARN", "storage.compression_migration_skipped", table=table, error=str(e))
 
         # Reclaim the freed pages on disk. SQLite UPDATE leaves the bytes the
         # row used to occupy as free space inside the file — without VACUUM
@@ -906,44 +1308,38 @@ class StatsStorage:
         # autocommit-ish state and VACUUM just works.
         if total_rewrites > 0:
             try:
-                print(
-                    f"[StatsStorage] v0.0.5 compression migration: running "
-                    f"VACUUM to reclaim freed pages (this rebuilds the DB file)..."
-                )
+                log_event("INFO", "storage.vacuum_started", reason="compression_migration")
                 self.conn.execute("VACUUM")
-                print("[StatsStorage] v0.0.5 compression migration: VACUUM done")
+                log_event("INFO", "storage.vacuum_done", reason="compression_migration")
             except sqlite3.OperationalError as e:
                 # If VACUUM fails (e.g. DB busy, disk full) the data is
                 # still correct — just the file size hasn't shrunk yet.
                 # Operator can run VACUUM manually later via the sqlite3
                 # CLI. Don't crash startup.
-                print(
-                    f"[StatsStorage] v0.0.5 compression migration: VACUUM "
-                    f"failed ({e}). Data is correct; rerun "
-                    f"`sqlite3 {self.db_path} 'VACUUM'` to reclaim disk."
-                )
+                log_event("WARN", "storage.vacuum_failed", db=self.db_path, error=str(e))
 
     # ---- snapshots ----
-    def get_latest_snapshot(self, name: str, platform: str = "steam") -> Optional[Dict[str, Any]]:
-        cur = self.conn.cursor()
-        cur.execute("""
-            SELECT * FROM snapshots
-            WHERE name=? AND platform=?
-            ORDER BY captured_at DESC
-            LIMIT 1
-        """, (name, platform))
-        row = cur.fetchone()
-        if not row:
-            return None
-        return {
-            "id": row["id"],
-            "name": row["name"],
-            "platform": row["platform"],
-            "captured_at": row["captured_at"],
-            "update_hash": row["update_hash"],
-            "account_id": row["account_id"],
-            "data": json.loads(row["data_json"]),
-        }
+    def get_latest_snapshot(self, name: str, platform: str = "") -> Optional[Dict[str, Any]]:
+        with self._db_lock:
+            cur = self.conn.cursor()
+            cur.execute("""
+                SELECT * FROM snapshots
+                WHERE name=? AND platform=?
+                ORDER BY captured_at DESC
+                LIMIT 1
+            """, (name, platform))
+            row = cur.fetchone()
+            if not row:
+                return None
+            return {
+                "id": row["id"],
+                "name": row["name"],
+                "platform": row["platform"],
+                "captured_at": row["captured_at"],
+                "update_hash": row["update_hash"],
+                "account_id": row["account_id"],
+                "data": json.loads(row["data_json"]),
+            }
 
     def save_snapshot(
         self,
@@ -954,30 +1350,32 @@ class StatsStorage:
         account_id: Optional[str] = None,
         captured_at: Optional[str] = None
     ) -> Dict[str, str]:
-        captured_at = captured_at or _utc_iso()
-        sid = str(uuid.uuid4())
+        with self._db_lock:
+            captured_at = captured_at or _utc_iso()
+            sid = str(uuid.uuid4())
 
-        cur = self.conn.cursor()
-        cur.execute("""
-            INSERT INTO snapshots(id, name, platform, captured_at, update_hash, account_id, data_json)
-            VALUES(?,?,?,?,?,?,?)
-        """, (
-            sid, name, platform, captured_at, update_hash,
-            str(account_id) if account_id is not None else None,
-            json.dumps(data, ensure_ascii=False)
-        ))
-        self.conn.commit()
-        return {"id": sid, "captured_at": captured_at}
+            cur = self.conn.cursor()
+            cur.execute("""
+                INSERT INTO snapshots(id, name, platform, captured_at, update_hash, account_id, data_json)
+                VALUES(?,?,?,?,?,?,?)
+            """, (
+                sid, name, platform, captured_at, update_hash,
+                str(account_id) if account_id is not None else None,
+                json.dumps(data, ensure_ascii=False)
+            ))
+            self.conn.commit()
+            return {"id": sid, "captured_at": captured_at}
 
     # ---- matches ----
     def _match_exists_for_hash(self, name: str, platform: str, to_hash: str) -> bool:
-        cur = self.conn.cursor()
-        cur.execute("""
-            SELECT 1 FROM matches
-            WHERE name=? AND platform=? AND to_hash=?
-            LIMIT 1
-        """, (name, platform, to_hash))
-        return cur.fetchone() is not None
+        with self._db_lock:
+            cur = self.conn.cursor()
+            cur.execute("""
+                SELECT 1 FROM matches
+                WHERE name=? AND platform=? AND to_hash=?
+                LIMIT 1
+            """, (name, platform, to_hash))
+            return cur.fetchone() is not None
 
     def save_match(
         self,
@@ -989,43 +1387,46 @@ class StatsStorage:
         account_id: Optional[str] = None,
         created_at: Optional[str] = None
     ) -> str:
-        created_at = created_at or _utc_iso()
-        mid = str(uuid.uuid4())
+        with self._db_lock:
+            created_at = created_at or _utc_iso()
+            mid = str(uuid.uuid4())
 
-        cur = self.conn.cursor()
-        cur.execute("""
-            INSERT INTO matches(id, name, platform, created_at, from_hash, to_hash, account_id, match_json)
-            VALUES(?,?,?,?,?,?,?,?)
-        """, (
-            mid, name, platform, created_at,
-            from_hash, to_hash,
-            str(account_id) if account_id is not None else None,
-            _codec.pack(match_obj),
-        ))
-        self.conn.commit()
-        return mid
+            cur = self.conn.cursor()
+            cur.execute("""
+                INSERT INTO matches(id, name, platform, created_at, from_hash, to_hash, account_id, match_json)
+                VALUES(?,?,?,?,?,?,?,?)
+            """, (
+                mid, name, platform, created_at,
+                from_hash, to_hash,
+                str(account_id) if account_id is not None else None,
+                _codec.pack(match_obj),
+            ))
+            self.conn.commit()
+            return mid
 
-    def count_matches(self, name: str, platform: str = "steam") -> int:
-        cur = self.conn.cursor()
-        cur.execute(
-            "SELECT COUNT(*) AS n FROM matches WHERE name=? AND platform=?",
-            (name, platform),
-        )
-        row = cur.fetchone()
-        return int(row["n"]) if row else 0
+    def count_matches(self, name: str, platform: str = "") -> int:
+        with self._db_lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                "SELECT COUNT(*) AS n FROM matches WHERE name=? AND platform=?",
+                (name, platform),
+            )
+            row = cur.fetchone()
+            return int(row["n"]) if row else 0
 
-    def list_matches(self, name: str, platform: str = "steam", limit: int = 20, offset: int = 0) -> List[Dict[str, Any]]:
-        cur = self.conn.cursor()
-        cur.execute("""
-            SELECT match_json FROM matches
-            WHERE name=? AND platform=?
-            ORDER BY created_at DESC
-            LIMIT ? OFFSET ?
-        """, (name, platform, limit, offset))
-        rows = cur.fetchall()
-        return [_codec.unpack(r["match_json"]) for r in rows]
+    def list_matches(self, name: str, platform: str = "", limit: int = 20, offset: int = 0) -> List[Dict[str, Any]]:
+        with self._db_lock:
+            cur = self.conn.cursor()
+            cur.execute("""
+                SELECT match_json FROM matches
+                WHERE name=? AND platform=?
+                ORDER BY created_at DESC
+                LIMIT ? OFFSET ?
+            """, (name, platform, limit, offset))
+            rows = cur.fetchall()
+            return [_codec.unpack(r["match_json"]) for r in rows]
 
-    def build_matches_response(self, name: str, platform: str = "steam", limit: int = 20, offset: int = 0) -> Dict[str, Any]:
+    def build_matches_response(self, name: str, platform: str = "", limit: int = 20, offset: int = 0) -> Dict[str, Any]:
         return {"data": {"matches": self.list_matches(name, platform, limit, offset)}}
 
     # ---- one-shot: snapshot + delta match ----
@@ -1038,60 +1439,61 @@ class StatsStorage:
         update_hash: str,
         new_data: Dict[str, Any]
     ) -> Dict[str, Any]:
-        last = self.get_latest_snapshot(name, platform)
-        now_iso = _utc_iso()
+        with self._db_lock:
+            last = self.get_latest_snapshot(name, platform)
+            now_iso = _utc_iso()
 
-        # no change
-        if last and last["update_hash"] == update_hash:
-            return {
-                "changed": False,
-                "snapshotSaved": False,
-                "matchSaved": False,
-                "toHash": update_hash,
-                "fromHash": last["update_hash"],
-                "createdAt": now_iso,
-            }
+            # no change
+            if last and last["update_hash"] == update_hash:
+                return {
+                    "changed": False,
+                    "snapshotSaved": False,
+                    "matchSaved": False,
+                    "toHash": update_hash,
+                    "fromHash": last["update_hash"],
+                    "createdAt": now_iso,
+                }
 
-        # save new snapshot
-        self.save_snapshot(
-            name=name,
-            platform=platform,
-            update_hash=update_hash,
-            data=new_data,
-            account_id=str(account_id) if account_id is not None else None,
-            captured_at=now_iso
-        )
-
-        match_saved = False
-        from_hash = last["update_hash"] if last else None
-
-        # create delta match if we have previous snapshot
-        if last and not self._match_exists_for_hash(name, platform, update_hash):
-            delta_match = build_trn_like_delta_match(
-                account_id=str(account_id) if account_id is not None else (last.get("account_id") or ""),
-                old_data=last["data"],
-                new_data=new_data,
-                timestamp=now_iso
-            )
-            self.save_match(
+            # save new snapshot
+            self.save_snapshot(
                 name=name,
                 platform=platform,
-                match_obj=delta_match,
-                from_hash=from_hash,
-                to_hash=update_hash,
+                update_hash=update_hash,
+                data=new_data,
                 account_id=str(account_id) if account_id is not None else None,
-                created_at=now_iso
+                captured_at=now_iso
             )
-            match_saved = True
 
-        return {
-            "changed": True,
-            "snapshotSaved": True,
-            "matchSaved": match_saved,
-            "toHash": update_hash,
-            "fromHash": from_hash,
-            "createdAt": now_iso,
-        }
+            match_saved = False
+            from_hash = last["update_hash"] if last else None
+
+            # create delta match if we have previous snapshot
+            if last and not self._match_exists_for_hash(name, platform, update_hash):
+                delta_match = build_trn_like_delta_match(
+                    account_id=str(account_id) if account_id is not None else (last.get("account_id") or ""),
+                    old_data=last["data"],
+                    new_data=new_data,
+                    timestamp=now_iso
+                )
+                self.save_match(
+                    name=name,
+                    platform=platform,
+                    match_obj=delta_match,
+                    from_hash=from_hash,
+                    to_hash=update_hash,
+                    account_id=str(account_id) if account_id is not None else None,
+                    created_at=now_iso
+                )
+                match_saved = True
+
+            return {
+                "changed": True,
+                "snapshotSaved": True,
+                "matchSaved": match_saved,
+                "toHash": update_hash,
+                "fromHash": from_hash,
+                "createdAt": now_iso,
+            }
 
     # ============================================================
     # NEW: profile-keyed store + delta (TRN-profile shape)
@@ -1099,43 +1501,45 @@ class StatsStorage:
 
     def get_profile(self, platform_user_identifier: str) -> Optional[Dict[str, Any]]:
         """Return the currently-stored TRN profile for this user, or None."""
-        cur = self.conn.cursor()
-        cur.execute(
-            "SELECT * FROM profiles WHERE platform_user_identifier=? LIMIT 1",
-            (str(platform_user_identifier),),
-        )
-        row = cur.fetchone()
-        if not row:
-            return None
-        return {
-            "platformUserIdentifier": row["platform_user_identifier"],
-            "platform":                row["platform"],
-            "name":                    row["name"],
-            "updateHash":              row["update_hash"],
-            "updatedAt":               row["updated_at"],
-            "trnProfile":              _codec.unpack(row["trn_profile_json"]),
-        }
+        with self._db_lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                "SELECT * FROM profiles WHERE platform_user_identifier=? LIMIT 1",
+                (str(platform_user_identifier),),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            return {
+                "platformUserIdentifier": row["platform_user_identifier"],
+                "platform":                row["platform"],
+                "name":                    row["name"],
+                "updateHash":              row["update_hash"],
+                "updatedAt":               row["updated_at"],
+                "trnProfile":              _codec.unpack(row["trn_profile_json"]),
+            }
 
     def list_profiles(self) -> List[Dict[str, Any]]:
         """Return every stored profile row — used by the background poller to
         decide who to refresh. Only includes the lightweight header columns;
         skip the full TRN JSON blob."""
-        cur = self.conn.cursor()
-        cur.execute("""
-            SELECT platform_user_identifier, platform, name, update_hash, updated_at
-            FROM profiles
-            ORDER BY updated_at ASC
-        """)
-        return [
-            {
-                "platformUserIdentifier": r["platform_user_identifier"],
-                "platform":                r["platform"],
-                "name":                    r["name"],
-                "updateHash":              r["update_hash"],
-                "updatedAt":               r["updated_at"],
-            }
-            for r in cur.fetchall()
-        ]
+        with self._db_lock:
+            cur = self.conn.cursor()
+            cur.execute("""
+                SELECT platform_user_identifier, platform, name, update_hash, updated_at
+                FROM profiles
+                ORDER BY updated_at ASC
+            """)
+            return [
+                {
+                    "platformUserIdentifier": r["platform_user_identifier"],
+                    "platform":                r["platform"],
+                    "name":                    r["name"],
+                    "updateHash":              r["update_hash"],
+                    "updatedAt":               r["updated_at"],
+                }
+                for r in cur.fetchall()
+            ]
 
     def upsert_profile(
         self,
@@ -1148,26 +1552,27 @@ class StatsStorage:
         updated_at: Optional[str] = None,
     ) -> None:
         """Insert or overwrite the profile row for this identifier."""
-        updated_at = updated_at or _utc_iso()
-        cur = self.conn.cursor()
-        cur.execute("""
-            INSERT INTO profiles(platform_user_identifier, platform, name, update_hash, updated_at, trn_profile_json)
-            VALUES(?,?,?,?,?,?)
-            ON CONFLICT(platform_user_identifier) DO UPDATE SET
-                platform         = excluded.platform,
-                name             = excluded.name,
-                update_hash      = excluded.update_hash,
-                updated_at       = excluded.updated_at,
-                trn_profile_json = excluded.trn_profile_json
-        """, (
-            str(platform_user_identifier),
-            platform,
-            name,
-            update_hash,
-            updated_at,
-            _codec.pack(trn_profile),
-        ))
-        self.conn.commit()
+        with self._db_lock:
+            updated_at = updated_at or _utc_iso()
+            cur = self.conn.cursor()
+            cur.execute("""
+                INSERT INTO profiles(platform_user_identifier, platform, name, update_hash, updated_at, trn_profile_json)
+                VALUES(?,?,?,?,?,?)
+                ON CONFLICT(platform_user_identifier) DO UPDATE SET
+                    platform         = excluded.platform,
+                    name             = excluded.name,
+                    update_hash      = excluded.update_hash,
+                    updated_at       = excluded.updated_at,
+                    trn_profile_json = excluded.trn_profile_json
+            """, (
+                str(platform_user_identifier),
+                platform,
+                name,
+                update_hash,
+                updated_at,
+                _codec.pack(trn_profile),
+            ))
+            self.conn.commit()
 
     def save_profile_match(
         self,
@@ -1190,41 +1595,42 @@ class StatsStorage:
         v0.0.4: switched from INSERT OR REPLACE to INSERT OR IGNORE so a
         concurrent duplicate cannot overwrite the original match's id.
         """
-        created_at = created_at or _utc_iso()
-        ident = str(platform_user_identifier)
-        # prefer the match's own id so list_profile_matches returns the same id
-        mid = ((match_obj.get("attributes") or {}).get("id")) or str(uuid.uuid4())
-        cur = self.conn.cursor()
-        cur.execute("""
-            INSERT OR IGNORE INTO matches(id, platform_user_identifier, created_at, from_hash, to_hash, match_json)
-            VALUES(?,?,?,?,?,?)
-        """, (
-            str(mid),
-            ident,
-            created_at,
-            from_hash,
-            to_hash,
-            _codec.pack(match_obj),
-        ))
-        inserted = cur.rowcount > 0
-        if not inserted:
-            # The UNIQUE(platform_user_identifier, COALESCE(from_hash,''), to_hash)
-            # index rejected our row — another worker already saved this exact
-            # transition. Look up the original match's id so callers still get
-            # something to reference. COALESCE on the lookup must mirror the
-            # index's COALESCE so a NULL from_hash matches the '' index entry.
+        with self._db_lock:
+            created_at = created_at or _utc_iso()
+            ident = str(platform_user_identifier)
+            # prefer the match's own id so list_profile_matches returns the same id
+            mid = ((match_obj.get("attributes") or {}).get("id")) or str(uuid.uuid4())
+            cur = self.conn.cursor()
             cur.execute("""
-                SELECT id FROM matches
-                WHERE platform_user_identifier = ?
-                  AND COALESCE(from_hash, '') = COALESCE(?, '')
-                  AND to_hash = ?
-                LIMIT 1
-            """, (ident, from_hash, to_hash))
-            row = cur.fetchone()
-            if row and row["id"]:
-                mid = str(row["id"])
-        self.conn.commit()
-        return str(mid), inserted
+                INSERT OR IGNORE INTO matches(id, platform_user_identifier, created_at, from_hash, to_hash, match_json)
+                VALUES(?,?,?,?,?,?)
+            """, (
+                str(mid),
+                ident,
+                created_at,
+                from_hash,
+                to_hash,
+                _codec.pack(match_obj),
+            ))
+            inserted = cur.rowcount > 0
+            if not inserted:
+                # The UNIQUE(platform_user_identifier, COALESCE(from_hash,''), to_hash)
+                # index rejected our row — another worker already saved this exact
+                # transition. Look up the original match's id so callers still get
+                # something to reference. COALESCE on the lookup must mirror the
+                # index's COALESCE so a NULL from_hash matches the '' index entry.
+                cur.execute("""
+                    SELECT id FROM matches
+                    WHERE platform_user_identifier = ?
+                      AND COALESCE(from_hash, '') = COALESCE(?, '')
+                      AND to_hash = ?
+                    LIMIT 1
+                """, (ident, from_hash, to_hash))
+                row = cur.fetchone()
+                if row and row["id"]:
+                    mid = str(row["id"])
+            self.conn.commit()
+            return str(mid), inserted
 
     def list_profile_matches(
         self,
@@ -1233,23 +1639,326 @@ class StatsStorage:
         limit: int = 20,
         offset: int = 0,
     ) -> List[Dict[str, Any]]:
-        cur = self.conn.cursor()
-        cur.execute("""
-            SELECT match_json FROM matches
-            WHERE platform_user_identifier=?
-            ORDER BY created_at DESC
-            LIMIT ? OFFSET ?
-        """, (str(platform_user_identifier), limit, offset))
-        return [_codec.unpack(r["match_json"]) for r in cur.fetchall()]
+        with self._db_lock:
+            cur = self.conn.cursor()
+            cur.execute("""
+                SELECT match_json FROM matches
+                WHERE platform_user_identifier=?
+                ORDER BY created_at DESC
+                LIMIT ? OFFSET ?
+            """, (str(platform_user_identifier), limit, offset))
+            return [_codec.unpack(r["match_json"]) for r in cur.fetchall()]
 
     def count_profile_matches(self, platform_user_identifier: str) -> int:
-        cur = self.conn.cursor()
-        cur.execute(
-            "SELECT COUNT(*) AS n FROM matches WHERE platform_user_identifier=?",
-            (str(platform_user_identifier),),
-        )
-        row = cur.fetchone()
-        return int(row["n"]) if row else 0
+        with self._db_lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                "SELECT COUNT(*) AS n FROM matches WHERE platform_user_identifier=?",
+                (str(platform_user_identifier),),
+            )
+            row = cur.fetchone()
+            return int(row["n"]) if row else 0
+
+    # ---- tracked count snapshots ----
+
+    def count_tracked_players(self) -> int:
+        with self._db_lock:
+            cur = self.conn.cursor()
+            cur.execute("SELECT COUNT(*) AS n FROM profiles")
+            row = cur.fetchone()
+            return int(row["n"]) if row else 0
+
+    def count_tracked_matches(self) -> int:
+        with self._db_lock:
+            cur = self.conn.cursor()
+            cur.execute("SELECT COUNT(*) AS n FROM matches")
+            row = cur.fetchone()
+            return int(row["n"]) if row else 0
+
+    def save_tracked_count_snapshot(
+        self,
+        *,
+        calculated_at: str,
+        players_tracked: int,
+        matches_tracked: int,
+        calculation_ms: int,
+    ) -> Dict[str, Any]:
+        with self._db_lock:
+            snapshot_id = str(uuid.uuid4())
+            cur = self.conn.cursor()
+            cur.execute("""
+                INSERT INTO tracked_count_history(
+                    id,
+                    calculated_at,
+                    players_tracked,
+                    matches_tracked,
+                    calculation_ms
+                )
+                VALUES(?,?,?,?,?)
+            """, (
+                snapshot_id,
+                calculated_at,
+                int(players_tracked),
+                int(matches_tracked),
+                int(calculation_ms),
+            ))
+            self.conn.commit()
+            return {
+                "id": snapshot_id,
+                "calculatedAt": calculated_at,
+                "playersTracked": int(players_tracked),
+                "matchesTracked": int(matches_tracked),
+                "calculationMs": int(calculation_ms),
+            }
+
+    def get_latest_tracked_count_snapshot(self) -> Optional[Dict[str, Any]]:
+        with self._db_lock:
+            cur = self.conn.cursor()
+            cur.execute("""
+                SELECT id, calculated_at, players_tracked, matches_tracked, calculation_ms
+                FROM tracked_count_history
+                ORDER BY calculated_at DESC
+                LIMIT 1
+            """)
+            row = cur.fetchone()
+            if not row:
+                return None
+            return {
+                "id": row["id"],
+                "calculatedAt": row["calculated_at"],
+                "playersTracked": int(row["players_tracked"]),
+                "matchesTracked": int(row["matches_tracked"]),
+                "calculationMs": int(row["calculation_ms"]),
+            }
+
+    # ---- player suspicion reports ----
+
+    def check_and_record_suspicion_attempt(
+        self,
+        *,
+        reporter_key: str,
+        reporter_ip_hash: Optional[str],
+        target_platform_user_identifier: str,
+        now_iso: str,
+        minute_cutoff_iso: str,
+        hour_cutoff_iso: str,
+        day_cutoff_iso: str,
+        reporter_hour_limit: int,
+        reporter_day_limit: int,
+        ip_hour_limit: int,
+        target_minute_limit: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Return a rate-limit dict if this suspicion POST should be blocked.
+
+        The DB uniqueness constraint handles the one-mark-per-day rule. This
+        method protects the route from high-volume attempts, including duplicate
+        same-day POSTs that would otherwise never create report rows.
+        """
+        with self._db_lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                "DELETE FROM player_suspicion_rate_events WHERE created_at < ?",
+                (day_cutoff_iso,),
+            )
+
+            def count(sql: str, args: Tuple[Any, ...]) -> int:
+                cur.execute(sql, args)
+                row = cur.fetchone()
+                return int(row["n"]) if row else 0
+
+            reporter_hour = count("""
+                SELECT COUNT(*) AS n
+                FROM player_suspicion_rate_events
+                WHERE reporter_key = ? AND created_at >= ?
+            """, (reporter_key, hour_cutoff_iso))
+            if reporter_hour >= reporter_hour_limit:
+                self.conn.commit()
+                return {"scope": "reporter_hour", "retryAfterSec": 3600}
+
+            reporter_day = count("""
+                SELECT COUNT(*) AS n
+                FROM player_suspicion_rate_events
+                WHERE reporter_key = ? AND created_at >= ?
+            """, (reporter_key, day_cutoff_iso))
+            if reporter_day >= reporter_day_limit:
+                self.conn.commit()
+                return {"scope": "reporter_day", "retryAfterSec": 86400}
+
+            if reporter_ip_hash:
+                ip_hour = count("""
+                    SELECT COUNT(*) AS n
+                    FROM player_suspicion_rate_events
+                    WHERE reporter_ip_hash = ? AND created_at >= ?
+                """, (reporter_ip_hash, hour_cutoff_iso))
+                if ip_hour >= ip_hour_limit:
+                    self.conn.commit()
+                    return {"scope": "ip_hour", "retryAfterSec": 3600}
+
+            target_minute = count("""
+                SELECT COUNT(*) AS n
+                FROM player_suspicion_rate_events
+                WHERE target_platform_user_identifier = ? AND created_at >= ?
+            """, (str(target_platform_user_identifier), minute_cutoff_iso))
+            if target_minute >= target_minute_limit:
+                self.conn.commit()
+                return {"scope": "target_minute", "retryAfterSec": 60}
+
+            cur.execute("""
+                INSERT INTO player_suspicion_rate_events(
+                    id,
+                    reporter_key,
+                    reporter_ip_hash,
+                    target_platform_user_identifier,
+                    created_at
+                )
+                VALUES(?,?,?,?,?)
+            """, (
+                str(uuid.uuid4()),
+                reporter_key,
+                reporter_ip_hash,
+                str(target_platform_user_identifier),
+                now_iso,
+            ))
+            self.conn.commit()
+            return None
+
+    def create_suspicion_report(
+        self,
+        *,
+        target_platform_user_identifier: str,
+        reporter_key: str,
+        report_date: str,
+        types: List[str],
+        created_at: str,
+        reporter_ip_hash: Optional[str],
+        cf_ray: Optional[str],
+        user_agent_hash: Optional[str],
+    ) -> Dict[str, Any]:
+        """Create one daily suspicion report, or return the existing same-day row."""
+        with self._db_lock:
+            ident = str(target_platform_user_identifier)
+            report_id = str(uuid.uuid4())
+            clean_types = sorted(set(t for t in types if t))
+            cur = self.conn.cursor()
+            cur.execute("""
+                INSERT OR IGNORE INTO player_suspicion_reports(
+                    id,
+                    target_platform_user_identifier,
+                    reporter_key,
+                    report_date,
+                    created_at,
+                    reporter_ip_hash,
+                    cf_ray,
+                    user_agent_hash
+                )
+                VALUES(?,?,?,?,?,?,?,?)
+            """, (
+                report_id,
+                ident,
+                reporter_key,
+                report_date,
+                created_at,
+                reporter_ip_hash,
+                cf_ray,
+                user_agent_hash,
+            ))
+            created = cur.rowcount > 0
+
+            if created and clean_types:
+                cur.executemany("""
+                    INSERT OR IGNORE INTO player_suspicion_report_types(report_id, type)
+                    VALUES(?,?)
+                """, [(report_id, t) for t in clean_types])
+            elif not created:
+                cur.execute("""
+                    SELECT id
+                    FROM player_suspicion_reports
+                    WHERE target_platform_user_identifier = ?
+                      AND reporter_key = ?
+                      AND report_date = ?
+                    LIMIT 1
+                """, (ident, reporter_key, report_date))
+                row = cur.fetchone()
+                if row and row["id"]:
+                    report_id = str(row["id"])
+
+            self.conn.commit()
+            return {
+                "reportId": report_id,
+                "created": created,
+                "alreadyMarkedToday": not created,
+                "types": clean_types,
+            }
+
+    def get_suspicion_summary(
+        self,
+        target_platform_user_identifier: str,
+        *,
+        today: str,
+        last7_start: str,
+    ) -> Dict[str, Any]:
+        with self._db_lock:
+            ident = str(target_platform_user_identifier)
+            cur = self.conn.cursor()
+
+            cur.execute("""
+                SELECT COUNT(*) AS n
+                FROM player_suspicion_reports
+                WHERE target_platform_user_identifier = ?
+                  AND report_date = ?
+            """, (ident, today))
+            today_count = int((cur.fetchone() or {"n": 0})["n"])
+
+            cur.execute("""
+                SELECT COUNT(*) AS n
+                FROM player_suspicion_reports
+                WHERE target_platform_user_identifier = ?
+                  AND report_date >= ?
+            """, (ident, last7_start))
+            last7_count = int((cur.fetchone() or {"n": 0})["n"])
+
+            cur.execute("""
+                SELECT COUNT(*) AS n
+                FROM player_suspicion_reports
+                WHERE target_platform_user_identifier = ?
+            """, (ident,))
+            total_count = int((cur.fetchone() or {"n": 0})["n"])
+
+            cur.execute("""
+                SELECT t.type, COUNT(*) AS n
+                FROM player_suspicion_report_types t
+                JOIN player_suspicion_reports r ON r.id = t.report_id
+                WHERE r.target_platform_user_identifier = ?
+                GROUP BY t.type
+                ORDER BY n DESC, t.type ASC
+            """, (ident,))
+            by_type = {str(r["type"]): int(r["n"]) for r in cur.fetchall()}
+
+            return {
+                "today": today_count,
+                "last7Days": last7_count,
+                "total": total_count,
+                "byType": by_type,
+            }
+
+    def has_suspicion_report_today(
+        self,
+        target_platform_user_identifier: str,
+        *,
+        reporter_key: str,
+        report_date: str,
+    ) -> bool:
+        with self._db_lock:
+            cur = self.conn.cursor()
+            cur.execute("""
+                SELECT 1
+                FROM player_suspicion_reports
+                WHERE target_platform_user_identifier = ?
+                  AND reporter_key = ?
+                  AND report_date = ?
+                LIMIT 1
+            """, (str(target_platform_user_identifier), reporter_key, report_date))
+            return cur.fetchone() is not None
 
     def upsert_profile_with_delta(
         self,
@@ -1266,119 +1975,129 @@ class StatsStorage:
         from the new one. On first-seen, the 'old profile' is treated as empty
         so the first match contains the player's cumulative stats.
         Returns an info dict describing what happened."""
-        try:
-            from .converter import build_trn_match_from_profiles
-        except ImportError:
-            from app.converter import build_trn_match_from_profiles  # type: ignore
+        with self._db_lock:
+            try:
+                from .converter import build_trn_match_from_profiles
+            except ImportError:
+                from app.converter import build_trn_match_from_profiles  # type: ignore
 
-        pinfo = ((trn_profile or {}).get("data") or {}).get("platformInfo") or {}
-        identifier = str(pinfo.get("platformUserIdentifier") or "").strip()
-        if not identifier:
-            raise ValueError("trn_profile is missing data.platformInfo.platformUserIdentifier")
+            pinfo = ((trn_profile or {}).get("data") or {}).get("platformInfo") or {}
+            identifier = str(pinfo.get("platformUserIdentifier") or "").strip()
+            if not identifier:
+                raise ValueError("trn_profile is missing data.platformInfo.platformUserIdentifier")
 
-        # v0.0.4 concurrency fix: serialize the entire read-existing → compare →
-        # save-match → save-profile flow per user. Without this, two concurrent
-        # /profile (or /refresh, or poller) calls for the same user both observe
-        # `existing.updateHash == H_old` and `update_hash == H_new`, both build a
-        # delta match with a fresh uuid, and both insert — producing duplicate
-        # match rows for the same H_old → H_new transition. Holding the per-user
-        # RLock around the whole flow guarantees the second caller re-reads the
-        # already-committed H_new and short-circuits to the no-change branch.
-        # (FastAPI sync routes run in a threadpool, so concurrent requests are
-        # genuinely on different threads — an asyncio Lock would not be enough.)
-        user_lock = self._get_user_lock(identifier)
-        with user_lock:
-            existing = self.get_profile(identifier)
-            now_iso = _utc_iso()
+            # v0.0.4 concurrency fix: serialize the entire read-existing → compare →
+            # save-match → save-profile flow per user. Without this, two concurrent
+            # /profile (or /refresh, or poller) calls for the same user both observe
+            # `existing.updateHash == H_old` and `update_hash == H_new`, both build a
+            # delta match with a fresh uuid, and both insert — producing duplicate
+            # match rows for the same H_old → H_new transition. Holding the per-user
+            # RLock around the whole flow guarantees the second caller re-reads the
+            # already-committed H_new and short-circuits to the no-change branch.
+            # (FastAPI sync routes run in a threadpool, so concurrent requests are
+            # genuinely on different threads — an asyncio Lock would not be enough.)
+            user_lock = self._get_user_lock(identifier)
+            with user_lock:
+                existing = self.get_profile(identifier)
+                now_iso = _utc_iso()
 
-            # no change: same hash as stored (this is the branch the race loser
-            # falls into once the race winner has committed)
-            if existing and existing["updateHash"] == update_hash:
-                # v0.0.4 hot fix: gametools changed the platform query from
-                # `pc` to `ea/steam`, and we now default to `steam`. Old rows
-                # in the DB may still carry stale `platform`/`name` even
-                # though the underlying nucleus id is unchanged. When the
-                # hash hasn't moved we still patch name+platform so the
-                # stored row self-heals to whatever just succeeded against
-                # gametools. Keyed by the unique platform_user_identifier.
-                if existing["platform"] != platform or existing["name"] != name:
-                    cur = self.conn.cursor()
-                    cur.execute(
-                        "UPDATE profiles SET platform=?, name=? "
-                        "WHERE platform_user_identifier=?",
-                        (platform, name, identifier),
+                # no change: same hash as stored (this is the branch the race loser
+                # falls into once the race winner has committed)
+                if existing and existing["updateHash"] == update_hash:
+                    # Keep metadata in sync even when stats are unchanged. Old
+                    # rows in the DB may carry stale `platform`/`name` even
+                    # though the underlying nucleus id is unchanged. When the
+                    # hash hasn't moved we still patch name+platform to whatever
+                    # just succeeded against gametools. Keyed by the unique
+                    # platform_user_identifier.
+                    existing_pinfo = ((existing.get("trnProfile") or {}).get("data") or {}).get("platformInfo") or {}
+                    fresh_pinfo = ((trn_profile or {}).get("data") or {}).get("platformInfo") or {}
+                    metadata_changed = (
+                        existing["platform"] != platform
+                        or existing["name"] != name
+                        or existing_pinfo.get("platformSlug") != fresh_pinfo.get("platformSlug")
+                        or existing_pinfo.get("platformUserHandle") != fresh_pinfo.get("platformUserHandle")
                     )
-                    self.conn.commit()
-                return {
-                    "identifier":     identifier,
-                    "changed":        False,
-                    "firstSeen":      False,
-                    "profileSaved":   False,
-                    "matchSaved":     False,
-                    "toHash":         update_hash,
-                    "fromHash":       existing["updateHash"],
-                    "matchId":        None,
-                    "updatedAt":      existing["updatedAt"],
-                }
+                    if metadata_changed:
+                        self.upsert_profile(
+                            platform_user_identifier=identifier,
+                            platform=platform,
+                            name=name,
+                            update_hash=update_hash,
+                            trn_profile=trn_profile,
+                            updated_at=now_iso,
+                        )
+                    return {
+                        "identifier":     identifier,
+                        "changed":        False,
+                        "firstSeen":      False,
+                        "profileSaved":   bool(metadata_changed),
+                        "metadataChanged": bool(metadata_changed),
+                        "matchSaved":     False,
+                        "toHash":         update_hash,
+                        "fromHash":       existing["updateHash"],
+                        "matchId":        None,
+                        "updatedAt":      now_iso if metadata_changed else existing["updatedAt"],
+                    }
 
-            first_seen = existing is None
-            old_profile = existing["trnProfile"] if existing else None
-            from_hash = existing["updateHash"] if existing else None
+                first_seen = existing is None
+                old_profile = existing["trnProfile"] if existing else None
+                from_hash = existing["updateHash"] if existing else None
 
-            # build delta match
-            match = build_trn_match_from_profiles(
-                old_profile=old_profile,
-                new_profile=trn_profile,
-                account_id=identifier,
-                timestamp=now_iso,
-            )
-
-            # v0.0.4 zero-delta guard: skip persisting a match that contains no
-            # actual counter movement. This happens when the gametools update
-            # hash flips for reasons unrelated to gameplay (per-class
-            # secondsPlayed jitter, leaderboard recalc, etc.). We still want
-            # to overwrite the stored profile so the new updateHash sticks
-            # and the next genuine flip computes a correct delta — only the
-            # match save is skipped. First-seen always saves so brand-new
-            # users get their initial row regardless of counter values.
-            zero_delta = (not first_seen) and _is_zero_delta_match(match)
-            if zero_delta:
-                match_id, match_inserted = None, False
-            else:
-                match_id, match_inserted = self.save_profile_match(
-                    platform_user_identifier=identifier,
-                    match_obj=match,
-                    to_hash=update_hash,
-                    from_hash=from_hash,
-                    created_at=now_iso,
+                # build delta match
+                match = build_trn_match_from_profiles(
+                    old_profile=old_profile,
+                    new_profile=trn_profile,
+                    account_id=identifier,
+                    timestamp=now_iso,
                 )
 
-            # overwrite profile (always — the hash moved even if the delta is empty)
-            self.upsert_profile(
-                platform_user_identifier=identifier,
-                platform=platform,
-                name=name,
-                update_hash=update_hash,
-                trn_profile=trn_profile,
-                updated_at=now_iso,
-            )
+                # v0.0.4 zero-delta guard: skip persisting a match that contains no
+                # actual counter movement. This happens when the gametools update
+                # hash flips for reasons unrelated to gameplay (per-class
+                # secondsPlayed jitter, leaderboard recalc, etc.). We still want
+                # to overwrite the stored profile so the new updateHash sticks
+                # and the next genuine flip computes a correct delta — only the
+                # match save is skipped. First-seen always saves so brand-new
+                # users get their initial row regardless of counter values.
+                zero_delta = (not first_seen) and _is_zero_delta_match(match)
+                if zero_delta:
+                    match_id, match_inserted = None, False
+                else:
+                    match_id, match_inserted = self.save_profile_match(
+                        platform_user_identifier=identifier,
+                        match_obj=match,
+                        to_hash=update_hash,
+                        from_hash=from_hash,
+                        created_at=now_iso,
+                    )
 
-            return {
-                "identifier":     identifier,
-                "changed":        True,
-                "firstSeen":      first_seen,
-                "profileSaved":   True,
-                # match_inserted=False means either: (a) zero-delta guard
-                # filtered the match out, or (b) the UNIQUE transition index
-                # caught a cross-process race. Either way the profile is safe
-                # to overwrite.
-                "matchSaved":     bool(match_inserted),
-                "zeroDelta":      bool(zero_delta),
-                "toHash":         update_hash,
-                "fromHash":       from_hash,
-                "matchId":        match_id,
-                "updatedAt":      now_iso,
-            }
+                # overwrite profile (always — the hash moved even if the delta is empty)
+                self.upsert_profile(
+                    platform_user_identifier=identifier,
+                    platform=platform,
+                    name=name,
+                    update_hash=update_hash,
+                    trn_profile=trn_profile,
+                    updated_at=now_iso,
+                )
+
+                return {
+                    "identifier":     identifier,
+                    "changed":        True,
+                    "firstSeen":      first_seen,
+                    "profileSaved":   True,
+                    # match_inserted=False means either: (a) zero-delta guard
+                    # filtered the match out, or (b) the UNIQUE transition index
+                    # caught a cross-process race. Either way the profile is safe
+                    # to overwrite.
+                    "matchSaved":     bool(match_inserted),
+                    "zeroDelta":      bool(zero_delta),
+                    "toHash":         update_hash,
+                    "fromHash":       from_hash,
+                    "matchId":        match_id,
+                    "updatedAt":      now_iso,
+                }
 
 
 # ============================================================
@@ -1387,7 +2106,7 @@ class StatsStorage:
 
 if __name__ == "__main__":
     PLAYER_NAME = "BiliTV-2524OFM"   # TODO: 改成你的 ID/昵称（和 gametools 要求一致）
-    PLATFORM = "steam"
+    PLATFORM = ""
 
     client = GametoolsClient()
     storage = StatsStorage("bf6_stats.db")

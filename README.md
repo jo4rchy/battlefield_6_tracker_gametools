@@ -35,11 +35,15 @@ The whole thing is packaged into a single Docker image so you can drop it on a N
 
 Keyed by `platform_user_identifier` — the gametools nucleus id — so renaming your gametag never breaks history.
 
-| table      | cardinality per player | behaviour          | purpose                                   |
-|------------|------------------------|--------------------|-------------------------------------------|
-| `profiles` | 1                      | overwritten        | current career TRN profile                |
-| `matches`  | N                      | append-only        | full delta-match history (`/matches`)     |
-| `snapshots`| —                      | legacy, untouched  | old name-keyed flow, unused by the new API |
+| table                            | cardinality per player | behaviour          | purpose                                      |
+|----------------------------------|------------------------|--------------------|----------------------------------------------|
+| `profiles`                       | 1                      | overwritten        | current career TRN profile                   |
+| `matches`                        | N                      | append-only        | full delta-match history (`/matches`)        |
+| `tracked_count_history`          | N                      | append-only        | cached player/match count snapshots          |
+| `player_suspicion_reports`       | N                      | append-only daily  | one anonymous reporter mark per player/day   |
+| `player_suspicion_report_types`  | N                      | append-only        | optional reasons like `aimbot`, `wallhack`   |
+| `player_suspicion_rate_events`   | N                      | rolling cleanup    | POST attempt log for backend rate limits     |
+| `snapshots`                      | —                      | legacy, untouched  | old name-keyed flow, unused by the new API   |
 
 ## Endpoints
 
@@ -53,6 +57,10 @@ All routes return JSON.
 | GET  | `/search?query=<name>&platform=pc` | TRN-style search wrapper. Returns a single-entry list with `platformInfo` / `userInfo`. |
 | GET  | `/profile?identifier=<id>&platform=pc` *(or `?name=<name>`)* | Fetches stats + profile from Gametools (id-based fetch when `identifier` given), overwrites the stored TRN profile if `update_hash` changed, appends a delta match, and returns the full **TRN-shaped profile**. Pass `&raw=true` to return the raw Gametools payload instead. |
 | GET  | `/matches?identifier=<id>&platform=pc&limit=20&offset=0` *(or `?name=<name>`)* | Paged list of locally-computed **delta matches** in TRN "matches" shape. `metadata.next` points at the next page. |
+| GET  | `/tracked-counts` | Cached count summary for frontend display: players tracked, matches tracked, and when the count was calculated. |
+| GET  | `/players/<id>/suspicion` | Public suspicion summary plus whether the current anonymous reporter already marked this player today. |
+| GET  | `/players/<id>/suspicion/check` | Lightweight check response for `markedToday` only. |
+| POST | `/players/<id>/suspicion` | Mark a player suspicious once per anonymous reporter per UTC day. Optional body: `{"types":["aimbot","wallhack"]}`. |
 | POST | `/refresh?identifier=<id>&platform=pc` *(or `?name=<name>`)* | Force a fetch + upsert for one player. |
 | POST | `/refresh-all` | Fire the background poll immediately (sequentially refreshes every row in `profiles`). Returns a summary of what changed. |
 
@@ -64,6 +72,115 @@ All routes return JSON.
 - the id-based gametools endpoint is faster and doesn't need name resolution
 
 Falling back to `name` still works for first-time lookups; once a profile is stored it can be refreshed forever by identifier alone.
+
+### Suspicion reports
+
+Suspicion marking is keyed only by `platformUserIdentifier`; no platform is required because the same nucleus id can be reached through different platform aliases.
+
+The frontend marks a player with:
+
+```bash
+curl -X POST "http://localhost:8000/players/1009230165587/suspicion" \
+  -H "Content-Type: application/json" \
+  -d '{"types":["aimbot","wallhack"]}'
+```
+
+`types` is optional. Allowed values default to `aimbot`, `wallhack`, `recoil`, `movement`, `boosting`, `other`; this list is configurable with `BF6_SUSPICION_TYPES`.
+
+First mark today:
+
+```json
+{
+  "data": {
+    "identifier": "1009230165587",
+    "summary": {
+      "today": 1,
+      "last7Days": 1,
+      "last30Days": 1,
+      "total": 1,
+      "byType": {
+        "aimbot": 1,
+        "wallhack": 1
+      }
+    },
+    "viewer": {
+      "markedToday": true,
+      "reportDate": "2026-05-06"
+    },
+    "markedToday": true,
+    "alreadyMarkedToday": false,
+    "reportDate": "2026-05-06"
+  }
+}
+```
+
+If the same anonymous reporter marks the same player again on the same UTC day, the API returns `alreadyMarkedToday: true` and does not create another report. There is intentionally no unmark flow.
+
+For frontend display, prefer:
+
+```http
+GET /players/1009230165587/suspicion
+```
+
+It returns both public counts and the current viewer state:
+
+```json
+{
+  "data": {
+    "identifier": "1009230165587",
+    "summary": {
+      "today": 4,
+      "last7Days": 18,
+      "last30Days": 31,
+      "total": 42,
+      "byType": {
+        "aimbot": 9,
+        "wallhack": 7
+      }
+    },
+    "viewer": {
+      "markedToday": true,
+      "reportDate": "2026-05-06"
+    }
+  }
+}
+```
+
+For the player card, render the suspicion summary only when `summary.total > 0`. The useful display fields are `summary.total`, `summary.last7Days`, `summary.last30Days`, and each entry in `summary.byType`.
+
+`GET /players/<id>/suspicion/check` is available when the frontend only needs:
+
+```json
+{
+  "data": {
+    "identifier": "1009230165587",
+    "markedToday": true,
+    "reportDate": "2026-05-06"
+  }
+}
+```
+
+The anonymous reporter identity is a backend-issued, HMAC-signed, HttpOnly cookie. The frontend does not send a user id. The DB still stores `reporter_key` so SQLite can enforce `UNIQUE(target_platform_user_identifier, reporter_key, report_date)`.
+
+### Tracked counts
+
+`GET /tracked-counts` returns cached counts for public frontend copy such as "by 20260506 1944 UTC, we have tracked 123 players, 456 matches".
+
+```json
+{
+  "data": {
+    "playersTracked": 123,
+    "matchesTracked": 456,
+    "calculatedAt": "2026-05-06T19:44:00+00:00",
+    "calculatedAtDisplay": "20260506 1944 UTC",
+    "calculationMs": 1,
+    "intervalSec": 900,
+    "historyId": "..."
+  }
+}
+```
+
+The API does not count large tables on every request. A background task recalculates on `BF6_TRACKED_COUNTS_INTERVAL_SECONDS` and saves every result in `tracked_count_history`. If the service starts with no cached state, the first `/tracked-counts` call loads the latest history row; if no history exists yet, it calculates once and stores that first snapshot.
 
 ### Example profile response (truncated)
 
@@ -99,26 +216,92 @@ Match envelope shape is aligned 1:1 with the TRN `/matches` reference payload (`
 On startup, FastAPI spawns an asyncio task that loops:
 
 ```
-wait interval → refresh every profile in SQLite sequentially → repeat
+wait interval → batch-fetch fresh stats for every tracked player → for each
+player whose update_hash actually moved, fetch /bf6/profile/ and upsert →
+repeat
 ```
 
-Each refresh calls gametools with the stored `platformUserIdentifier` (`playerid=<id>&nucleus_id=<id>`) and routes the result through the same `upsert_profile_with_delta` used by `/profile`, so a delta match is appended automatically whenever counters move.
-
-Config (env vars):
-
-| var | default | purpose |
-|---|---|---|
-| `BF6_POLL_ENABLED`          | `true` | set to `false` to disable the background task |
-| `BF6_POLL_INTERVAL_SECONDS` | `300`  | seconds between polls (min 30) |
-| `BF6_POLL_STAGGER_SECONDS`  | `1.0`  | sleep between individual gametools calls so we don't burst them |
-| `BF6_DB_PATH`               | `data/bf6_stats.db` | SQLite path |
-| `BF6_CORS_ORIGINS`          | `*`    | comma-separated list of allowed origins |
+Stats are fetched in chunks of up to **128 players per HTTP request** through
+gametools' `POST /bf6/multiple/` endpoint. Several chunks run in parallel
+(`BF6_POLL_BATCH_WORKERS`). Players whose new hash matches the stored hash
+short-circuit immediately — no profile fetch, no DB write — so the per-cycle
+load scales with *active* players rather than total tracked. Players whose
+hash changed (or who are first-seen) go through the same
+`upsert_profile_with_delta` used by `/profile`, with `/bf6/profile/` fetched
+concurrently (`BF6_POLL_PROFILE_WORKERS`) for fresh rank / playerCard
+metadata. The keep-alive `requests.Session` shared by all calls eliminates
+the TCP/TLS handshake cost the old per-player loop paid twice per player.
 
 Inspect poller health at any time:
 
 ```bash
 curl -s http://<nas>:8000/status | jq
 ```
+
+`/status.poller` exposes `lastRunAt`, `lastRunMs`, `lastRunChanged`,
+`lastRunUnchanged`, `lastRunInvalid`, and the most recent `lastErrors[]`.
+
+## Configuration (compose env vars)
+
+Every supported variable is listed below with its default and effect. All
+are optional; omit a variable to use its default. The same set works in
+`compose.dev.yml`, `compose.prod.yml`, and `docker-compose.yml`.
+
+### Storage and network
+
+| var                          | default                | purpose |
+|------------------------------|------------------------|---------|
+| `BF6_DB_PATH`                | `data/bf6_stats.db`    | SQLite database path inside the container. The `./data` host mount in compose persists it across rebuilds. |
+| `BF6_CORS_ORIGINS`           | `*`                    | Comma-separated allowed origins for the global `CORSMiddleware`. The literals `any`, `all`, and `*` all mean "allow any origin"; in production set the exact frontend URL(s) instead. |
+| `BF6_SUSPICION_CORS_ORIGIN`  | `https://battlefield.joarchy.com` | Per-route origin lock that *only* applies to `POST /players/{id}/suspicion` — defends the report-write path even if the global CORS list is wide open. Set to empty string (`""`) to disable this extra check. |
+| `TZ`                         | (container default)    | Timezone for log timestamps and the UTC-day boundaries used by suspicion reports. Compose files set `Asia/Hong_Kong` or `Europe/London`. |
+
+### Background poller (batched stats + change-only profile fetch)
+
+| var                          | default | purpose |
+|------------------------------|---------|---------|
+| `BF6_POLL_ENABLED`           | `true`  | Master switch. Set `false` to disable the auto-refresh task entirely. |
+| `BF6_POLL_INTERVAL_SECONDS`  | `300`   | Seconds between full poll cycles. Floor 30s. |
+| `BF6_POLL_BATCH_SIZE`        | `20`    | Players per `POST /bf6/multiple/` request. Hard-capped at 128 (gametools upstream limit), but 20 is the safer default for full stat payloads behind Cloudflare. |
+| `BF6_POLL_BATCH_WORKERS`     | `4`     | Concurrent batch POSTs. Keep this modest; high fanout can trigger upstream 500/504 responses. |
+| `BF6_POLL_PROFILE_WORKERS`   | `4`     | Concurrent `/bf6/profile/` fetches for players whose `update_hash` moved. Profile is per-player (no batch endpoint), so this is the main remaining bottleneck. |
+| `BF6_POLL_STAGGER_SECONDS`   | `0.0`   | Delay between sequential stats batches and rescue batches. Useful when lowering `BF6_POLL_BATCH_WORKERS` to 1 for troubleshooting. |
+| `BF6_POLL_LOG_BATCH_SUCCESS` | `false` | Set `true` to print one success log per stats batch while tuning poller settings. |
+
+### Tracked-count cache
+
+| var                                      | default | purpose |
+|------------------------------------------|---------|---------|
+| `BF6_TRACKED_COUNTS_ENABLED`             | `true`  | Enable the background task that caches `playersTracked` / `matchesTracked` counts for `/tracked-counts`. |
+| `BF6_TRACKED_COUNTS_INTERVAL_SECONDS`    | `900`   | Seconds between count snapshots. Floor 60s. |
+
+### Anonymous reporter cookie
+
+| var                                | default                   | purpose |
+|------------------------------------|---------------------------|---------|
+| `BF6_REPORTER_COOKIE_NAME`         | `bf6_reporter_id`         | Cookie name used to identify the anonymous suspicion reporter. |
+| `BF6_REPORTER_COOKIE_SECRET`       | `bf6-tracker-dev-secret`  | HMAC signing secret for the reporter cookie. **Set a stable, secret production value.** Changing it invalidates every existing cookie and lets those visitors mark the same player again on the same day. |
+| `BF6_REPORTER_COOKIE_SECURE`       | `true`                    | Set `false` for plain-HTTP local dev. Browsers reject `SameSite=None` without `Secure=true`. |
+| `BF6_REPORTER_COOKIE_SAMESITE`     | `none`                    | `lax`, `strict`, or `none`. Use `none` for cross-site frontend/API setups (frontend on a different origin than the API); requires `Secure=true`. |
+| `BF6_REPORTER_COOKIE_MAX_AGE_SECONDS` | `34560000`            | Cookie lifetime in seconds. Default 400 days; floor 86400 (1 day). |
+
+### Suspicion-report rate and shape limits
+
+| var                                  | default                                            | purpose |
+|--------------------------------------|----------------------------------------------------|---------|
+| `BF6_SUSPICION_TYPES`                | `aimbot,wallhack,recoil,movement,boosting,other`   | Comma-separated allowlist of `types[]` values accepted on `POST /players/{id}/suspicion`. |
+| `BF6_SUSPICION_MAX_TYPES`            | `3`                                                | Max number of `types` accepted per POST body. |
+| `BF6_SUSPICION_REPORTER_HOUR_LIMIT`  | `30`                                               | Max POST attempts per anonymous reporter per hour. |
+| `BF6_SUSPICION_REPORTER_DAY_LIMIT`   | `100`                                              | Max POST attempts per anonymous reporter per day. |
+| `BF6_SUSPICION_IP_HOUR_LIMIT`        | `300`                                              | Hourly POST cap per IP hash. Generous on purpose so CGNAT / shared university networks don't get blanket-banned. |
+| `BF6_SUSPICION_TARGET_MINUTE_LIMIT`  | `60`                                               | Max POST attempts against any single target player per minute (anti-pile-on). |
+
+### Image-URL override dictionary (v0.0.6+)
+
+| var                    | default                | purpose |
+|------------------------|------------------------|---------|
+| `BF6_IMAGE_DICT_PATH`  | `data/image_dict.json` | Path to a JSON file mapping gametools `id` → CDN URL. Lives in the same `data/` volume as the SQLite DB so you can edit it on the host and `docker compose restart` to reload. |
+| `BF6_IMAGE_DICT_MODE`  | `fallback`             | `fallback` (gametools first, dict only when blank), `override` (dict first, gametools as backup), or `off` (ignore the dict entirely). |
 
 ## Local development
 
@@ -205,7 +388,34 @@ export async function getMatches(identifier: string, limit = 20, offset = 0, pla
   const r = await fetch(`/api/matches?identifier=${identifier}&platform=${platform}&limit=${limit}&offset=${offset}`);
   return r.json();
 }
+export async function getSuspicion(identifier: string) {
+  const r = await fetch(`/api/players/${encodeURIComponent(identifier)}/suspicion`, {
+    credentials: "include",
+  });
+  return r.json();
+}
+export async function markSuspicious(identifier: string, types: string[] = []) {
+  const r = await fetch(`/api/players/${encodeURIComponent(identifier)}/suspicion`, {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(types.length ? { types } : {}),
+  });
+  return r.json();
+}
 ```
+
+Suspicion endpoints need `credentials: "include"` so the browser sends/receives the anonymous reporter cookie. For deployed cross-origin frontend/API setups, do not leave `BF6_CORS_ORIGINS="*"`; set exact origins and configure cookie settings for HTTPS, for example:
+
+```yaml
+environment:
+  BF6_CORS_ORIGINS: "https://battlefieldtracker.joarchy.com,http://localhost:5173"
+  BF6_REPORTER_COOKIE_SECRET: "replace-with-a-long-random-secret"
+  BF6_REPORTER_COOKIE_SECURE: "true"
+  BF6_REPORTER_COOKIE_SAMESITE: "none"
+```
+
+When the API is behind Cloudflare, `CF-Connecting-IP` is used for abuse metadata/rate limiting if present. Only trust that header if the origin is not directly reachable except through Cloudflare; otherwise clients can spoof it.
 
 ## OBS widget
 
@@ -217,16 +427,35 @@ The storage is already compatible with a streaming widget:
 
 ## Changelog
 
+### v0.0.7.8 — batched poller (1,200 players in seconds, not 45 minutes)
+
+The background poller no longer iterates players one-by-one. It uses gametools' `POST /bf6/multiple/?categories=multiplayer` endpoint to fetch **up to 128 players per HTTP request**, then only refreshes profile metadata for players whose `update_hash` actually changed.
+
+- **`GametoolsClient.fetch_stats_batch_by_ids(items, chunk_size=20, max_workers=N)`** — new batch method on the client. Returns `{player_id: stats_payload}` with the same per-item correction logic as `fetch_stats_by_id`. Reuses a keep-alive `requests.Session` so per-player calls (`/profile`, `/refresh`, search) also stop paying the TCP/TLS handshake cost. Server-side 429/5xx responses are retried with short backoff, and failed chunks get one low-concurrency rescue pass before being marked failed.
+- **`_poll_once` rewrite** — three explicit phases: (1) batch-fetch every tracked player's stats; (2) classify each player as *unchanged* (skip), *invalid* (record error), or *changed/first-seen* (queue); (3) run upserts (which fetch `/bf6/profile/` for fresh rank metadata) concurrently for the queued players only. Unchanged players never produce a profile fetch or a DB write.
+- **New compose env knobs** — `BF6_POLL_BATCH_SIZE` (default 20, capped at 128), `BF6_POLL_BATCH_WORKERS` (default 4), `BF6_POLL_PROFILE_WORKERS` (default 4). `BF6_POLL_STAGGER_SECONDS` is now defaulted to `0.0` and applies to sequential/rescue batch requests. See *Configuration (compose env vars)* above.
+- **`/status.poller` additions** — `lastRunChanged`, `lastRunUnchanged`, `lastRunInvalid`, plus the new `batchSize` / `batchWorkers` / `profileWorkers` fields so operators can confirm which settings were applied.
+
+Measured behaviour at 1,200 tracked players: a full cycle now completes in seconds instead of ~45 minutes, and per-cycle wall time scales with how many players were *active* since the last poll, not with how many players are tracked. Output to the frontend is byte-identical — the TRN profile / matches shape is unchanged.
+
+`compose.dev.yml` and `compose.prod.yml` were updated to drop the legacy `BF6_POLL_STAGGER_SECONDS` line and set the new `BATCH_SIZE` / `BATCH_WORKERS` / `PROFILE_WORKERS` knobs explicitly.
+
+### v0.0.7 — anonymous suspicion reports
+
+Adds one-way player suspicion marking:
+
+- `POST /players/<id>/suspicion` records one anonymous reporter mark per player per UTC day.
+- Optional multiple reasons are accepted as `{"types":["aimbot","wallhack"]}` and stored in `player_suspicion_report_types`.
+- `GET /players/<id>/suspicion` returns public counts (`total`, `today`, `last7Days`, `last30Days`, `byType`) plus the current viewer's `markedToday` state.
+- `GET /players/<id>/suspicion/check` returns the lightweight check state only.
+- Anonymous reporter identity is a backend-issued HMAC-signed HttpOnly cookie; no frontend auth is required.
+- Backend rate limits are tracked in `player_suspicion_rate_events` and return HTTP `429` with `Retry-After`.
+
+Production operators should set a stable `BF6_REPORTER_COOKIE_SECRET`, configure exact `BF6_CORS_ORIGINS`, and use `credentials: "include"` in frontend fetches that call suspicion endpoints.
+
 ### v0.0.6 — image-URL override dictionary
 
-Gametools' CDN occasionally returns blank `image` / `altImage` fields, leaving the frontend with broken tiles. v0.0.6 adds a local override dictionary so operators can fill in missing assets without rebuilding the image.
-
-**Two env vars** control behaviour, both optional:
-
-| var | default | meaning |
-|---|---|---|
-| `BF6_IMAGE_DICT_PATH` | `data/image_dict.json` | path to the overrides JSON. Lives in the same `data/` volume as the SQLite DB so you can edit on the host without rebuilding. |
-| `BF6_IMAGE_DICT_MODE` | `fallback` | `fallback` (gametools first, dict only when blank), `override` (dict first, gametools as backup), or `off` (ignore dict entirely). |
+Gametools' CDN occasionally returns blank `image` / `altImage` fields, leaving the frontend with broken tiles. v0.0.6 adds a local override dictionary so operators can fill in missing assets without rebuilding the image. Configured via `BF6_IMAGE_DICT_PATH` and `BF6_IMAGE_DICT_MODE` — see *Configuration (compose env vars)* above.
 
 **File format** — flat JSON keyed by gametools `id`. Keys starting with `_comment_` are silently dropped at load, so you can use them as headings in the file without breaking lookups:
 

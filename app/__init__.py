@@ -18,4 +18,4 @@ Modules:
 # accepted by FastAPI's `version=` and shows up verbatim in the OpenAPI
 # spec, so keep it short and human-readable.
 # ---------------------------------------------------------------------------
-__version__ = "0.0.6"
+__version__ = "0.0.7.9"

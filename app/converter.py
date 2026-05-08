@@ -798,13 +798,11 @@ AVAILABLE_SEGMENT_TYPES = [
 
 def _platform_info(stats: Dict[str, Any], profile: Optional[Dict[str, Any]], name: str, platform: str) -> Dict[str, Any]:
     user_id = str(stats.get("userId") or stats.get("id") or "")
-    user_name = stats.get("userName") or name
+    user_name = name or stats.get("userName") or stats.get("username") or user_id
     # avatar = stats.get("avatar") or ""
     avatar = ""
-    # platform slug: gametools uses 'pc' which we map to 'origin' to match TRN
-    slug_map = {"pc": "origin", "xbox": "xbl", "ps": "psn"}
     return {
-        "platformSlug": slug_map.get(platform, platform),
+        "platformSlug": platform,
         "platformUserId": None,
         "platformUserHandle": user_name,
         "platformUserIdentifier": user_id,
